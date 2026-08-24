@@ -1,7 +1,7 @@
-# omp-collab-relay
+# omp-ngrok-relay
 
 Self-hostable relay for [omp](https://github.com/can1357/oh-my-pi) `/collab` sessions, with the
-browser guest client compiled into the binary and an optional built-in [ngrok](https://ngrok.com)
+browser guest client compiled into the binary and published on an [ngrok](https://ngrok.com)
 endpoint.
 
 `/collab` shares a live omp session with other terminals and browsers. By default that traffic goes
@@ -26,53 +26,49 @@ drop frames.
 ## Quick start
 
 ```sh
+export NGROK_AUTHTOKEN=...      # https://dashboard.ngrok.com/get-started/your-authtoken
 bun install
-bun run client          # build the pinned collab-web guest client into dist/
-bun run build           # compile bin/omp-collab-relay with the client embedded
-./bin/omp-collab-relay  # ws://127.0.0.1:7466
+bun run client                  # build the pinned collab-web guest client into dist/
+bun run build                   # compile bin/omp-ngrok-relay with the client embedded
+./bin/omp-ngrok-relay
 ```
 
 Or without cloning anything:
 
 ```sh
-nix run github:learnitall/omp-ngrok-relay
+NGROK_AUTHTOKEN=... nix run github:learnitall/omp-ngrok-relay
 ```
 
-Point an omp host at it, from any directory:
+Either way it prints the endpoint and how to point omp at it:
 
 ```
-/collab ws://localhost:7466
+omp-ngrok-relay 0.1.0 listening on ws://127.0.0.1:7466 (22 embedded client files)
+ngrok endpoint: https://swift-mouse-42.ngrok-free.app
+  relay:  omp config set collab.relayUrl wss://swift-mouse-42.ngrok-free.app
+  or one-shot, no config:  /collab wss://swift-mouse-42.ngrok-free.app
 ```
 
-## Public endpoints
+Guests join from a terminal (`omp join`) or from that URL in a browser.
+
+## Why the tunnel is not optional
 
 Plain `ws://` is only accepted for localhost — omp's link parser rejects it for any other host — so
-a relay other people can reach needs TLS. Two ways.
+a relay other people can reach needs TLS, which means a certificate, a DNS record and a reverse
+proxy in front. ngrok collapses all three into the process itself, so there is one thing to run and
+one thing to trust.
 
-**Built-in ngrok.** One process, no reverse proxy, no certificate:
+A local-only mode would be a relay nobody can join, so there isn't one: with no `NGROK_AUTHTOKEN`
+the binary exits before it binds a port. The local listener is still there as the tunnel's origin,
+and guests on the same machine can use `ws://127.0.0.1:7466` directly.
+
+For a stable address, reserve a domain on your ngrok account and name it:
 
 ```sh
-export NGROK_AUTHTOKEN=...
-./bin/omp-collab-relay --ngrok --ngrok-url https://collab.example.com
+./bin/omp-ngrok-relay --ngrok-url https://collab.example.com
 ```
 
-```
-omp-collab-relay 0.1.0 listening on ws://127.0.0.1:7466 (22 embedded client files)
-ngrok endpoint: https://collab.example.com
-  relay:  omp config set collab.relayUrl wss://collab.example.com
-  or one-shot, no config:  /collab wss://collab.example.com
-```
-
-`--ngrok-url` must already be reserved on your ngrok account, and its DNS must point at ngrok
-(`ERR_NGROK_319` otherwise). Drop the flag to take whatever URL your account defaults to.
-
-**Your own TLS.** Run it behind anything that proxies WebSocket upgrades:
-
-```caddy
-collab.example.com {
-    reverse_proxy 127.0.0.1:7466
-}
-```
+Its DNS must point at ngrok (`ERR_NGROK_319` otherwise). Without the flag you get whatever URL your
+account defaults to, which changes between runs on the free plan.
 
 ## Security model
 
@@ -143,13 +139,14 @@ the same package the clients compile against, so the contract cannot drift silen
 ## Options
 
 ```
---port <n>          local listen port (default 7466)
+--port <n>          local origin port the tunnel forwards to (default 7466)
 --hostname <host>   local bind address (default 127.0.0.1)
 --max-guests <n>    per-room guest cap, 0 = unlimited (default 0)
---ngrok             publish on a public ngrok endpoint (NGROK_AUTHTOKEN required)
 --ngrok-url <url>   reserved ngrok URL, e.g. https://collab.example.com
 --version, --help
 ```
+
+`NGROK_AUTHTOKEN` is required; there is no flag for it, since ngrok's own SDK reads it.
 
 ## Deployment
 
@@ -158,7 +155,7 @@ the same package the clients compile against, so the contract cannot drift silen
 ```ini
 [Service]
 Environment=NGROK_AUTHTOKEN=...
-ExecStart=/usr/local/bin/omp-collab-relay --ngrok --ngrok-url https://collab.example.com
+ExecStart=/usr/local/bin/omp-ngrok-relay --ngrok-url https://collab.example.com
 Restart=always
 DynamicUser=yes
 
@@ -170,7 +167,7 @@ WantedBy=multi-user.target
 
 ```sh
 nix build .#container && docker load < result
-docker run -p 7466:7466 -e NGROK_AUTHTOKEN omp-collab-relay:0.1.0
+docker run -p 7466:7466 -e NGROK_AUTHTOKEN omp-ngrok-relay:0.1.0
 ```
 
 **Releases.** Tagging `v*` cross-compiles binaries for linux and darwin on x64/arm64 (glibc and
@@ -196,20 +193,30 @@ with its peerId stamped and bytes intact, targeted frames not leaking to other g
 `@ngrok/ngrok`'s napi prebuild for the host platform only. `aarch64-darwin`, `aarch64-linux` and
 `x86_64-linux` are recorded; `x86_64-darwin` is not. Anything else fails at eval with instructions.
 
-A machine of that architecture is not required — a container is enough:
+A machine of that architecture is not required. The hash is a NAR hash of what `bun install`
+produces, so a container of that platform can produce the tree and nix can hash it anywhere:
 
 ```sh
-podman run --rm --platform linux/amd64 -v "$PWD:/src:ro" docker.io/nixos/nix \
-  sh -c 'nix --extra-experimental-features "nix-command flakes" \
-    --option filter-syscalls false build path:/src#relay'
+tar -cf - package.json bun.lock |
+  podman run --rm -i --platform linux/amd64 docker.io/oven/bun:1.3.13 \
+    sh -c 'mkdir /w && tar xf - -C /w && cd /w &&
+           bun install --frozen-lockfile 1>&2 && tar -cf - node_modules' |
+  tar -x -C /tmp/nm
+nix hash path --mode nar --type sha256 --sri /tmp/nm/node_modules
 ```
 
-Set the entry to `lib.fakeHash` first and nix reports the real one. `filter-syscalls false` is only
-needed under emulation: nix cannot load its seccomp filter there.
+Use the bun release nixpkgs pins, or the tree can differ. Running nix in the container works too —
+set the entry to `lib.fakeHash`, `nix build path:/src#relay`, and read the hash it reports — but
+only if the VM backend can emulate that architecture. On macOS an `applehv` podman machine (Rosetta)
+runs nix; a `libkrun` machine falls back to qemu user-mode, where nix segfaults on startup and only
+plain binaries such as bun still run. Under emulation nix also needs `--option filter-syscalls
+false`, since it cannot load its seccomp filter there.
 
-Emulating a foreign architecture depends on the VM backend, and nix is a demanding guest. On macOS
-an `applehv` machine (Rosetta) runs it; a `libkrun` machine falls back to qemu user-mode, where nix
-segfaults on startup and only plain binaries — the compiled relay included — run.
+**A stale entry is invisible locally.** A fixed-output derivation is addressed by the hash you
+declare: once a path with that hash is in the store, nix reuses it and never re-runs `bun install`.
+A dependency bump can sit unnoticed for as long as that path survives, and surface only on a fresh
+store — CI, or a rename that changes the derivation name. To force the check, set the entry to
+`lib.fakeHash` or recompute it with the recipe above.
 
 ## Credits
 

@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "omp-collab-relay",
+      "name": "omp-ngrok-relay",
       "dependencies": {
         "@ngrok/ngrok": "^1.7.0",
         "@oh-my-pi/pi-wire": "^18.0.4",

@@ -16,8 +16,12 @@
  *
  * Payloads are AES-256-GCM sealed by the clients; this process never holds a
  * key and never inspects anything past the 4-byte routing prefix.
+ *
+ * The local listener is only the tunnel's origin: the process always publishes
+ * itself through an ngrok endpoint, so NGROK_AUTHTOKEN is required.
  */
 import { parseArgs } from "node:util";
+import { forward } from "@ngrok/ngrok";
 import { ENVELOPE_HEADER_LENGTH, type RelayControlToGuest, type RelayControlToHost } from "@oh-my-pi/pi-wire";
 import { EMBEDDED_FILES } from "./dist-embed.generated";
 import { TRAFFIC_POLICY } from "./policy";
@@ -205,12 +209,12 @@ function serveStatic(pathname: string): Response {
 	return new Response(Bun.file(file));
 }
 
+/**
+ * The endpoint is the point of this process, so a failure here is fatal rather
+ * than degraded: a relay nobody can reach is not a working relay.
+ */
 async function startNgrok(port: number, url: string | undefined): Promise<void> {
-	// Dynamic on purpose: @ngrok/ngrok is a napi native addon with per-platform
-	// prebuilds. Loading it statically would make a missing/incompatible binary
-	// fatal for every run, including the ones that never asked for a tunnel.
-	const ngrok = await import("@ngrok/ngrok");
-	const listener = await ngrok.forward({
+	const listener = await forward({
 		addr: `127.0.0.1:${port}`,
 		authtoken_from_env: true,
 		domain: url ? new URL(url).hostname : undefined,
@@ -224,16 +228,15 @@ async function startNgrok(port: number, url: string | undefined): Promise<void> 
 	console.log(`  or one-shot, no config:  /collab wss://${host}`);
 }
 
-const HELP = `omp-collab-relay ${VERSION} — content-blind relay for omp collab sessions
+const HELP = `omp-ngrok-relay ${VERSION} — content-blind relay for omp collab sessions, published through ngrok
 
-  --port <n>          local listen port (default 7466)
+  --port <n>          local origin port the tunnel forwards to (default 7466)
   --hostname <host>   local bind address (default 127.0.0.1)
   --max-guests <n>    per-room guest cap, 0 = unlimited (default 0)
-  --ngrok             publish on a public ngrok endpoint (NGROK_AUTHTOKEN required)
   --ngrok-url <url>   reserved ngrok URL, e.g. https://collab.example.com
   --version, --help
 
-The traffic policy applied to the ngrok endpoint is compiled in; see policy.ts.`;
+NGROK_AUTHTOKEN is required. The traffic policy applied to the endpoint is compiled in; see policy.ts.`;
 
 if (import.meta.main) {
 	const { values } = parseArgs({
@@ -242,7 +245,6 @@ if (import.meta.main) {
 			port: { type: "string", default: "7466" },
 			hostname: { type: "string", default: "127.0.0.1" },
 			"max-guests": { type: "string", default: "0" },
-			ngrok: { type: "boolean", default: false },
 			"ngrok-url": { type: "string" },
 			version: { type: "boolean", default: false },
 			help: { type: "boolean", default: false },
@@ -257,6 +259,13 @@ if (import.meta.main) {
 		console.log(VERSION);
 		process.exit(0);
 	}
+	// Checked before the port is bound, so a missing token costs nothing.
+	if (!process.env.NGROK_AUTHTOKEN) {
+		console.error(
+			"NGROK_AUTHTOKEN is not set: this relay publishes itself through ngrok and has no local-only mode.",
+		);
+		process.exit(1);
+	}
 
 	const relay = startRelay({
 		port: Number(values.port),
@@ -265,12 +274,16 @@ if (import.meta.main) {
 	});
 	const embedded = Object.keys(EMBEDDED_FILES).length;
 	console.log(
-		`omp-collab-relay ${VERSION} listening on ${relay.url}` +
+		`omp-ngrok-relay ${VERSION} listening on ${relay.url}` +
 			(embedded > 0 ? ` (${embedded} embedded client files)` : " (no embedded web client)"),
 	);
 
-	if (values.ngrok) {
+	try {
 		await startNgrok(relay.port, values["ngrok-url"]);
+	} catch (err) {
+		console.error(`ngrok: ${err instanceof Error ? err.message : String(err)}`);
+		relay.stop();
+		process.exit(1);
 	}
 
 	const shutdown = (): void => {

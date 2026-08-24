@@ -35,17 +35,17 @@ jobs:
       - run: bun run test
       - run: bun run build
 
+      # No NGROK_AUTHTOKEN on a runner, and the relay has no local-only mode,
+      # so the binary can only be checked up to its refusal. The HTTP surface
+      # is covered by the tests, against the library.
       - name: Smoke test the binary
         run: |
-          ./bin/omp-collab-relay --version
-          ./bin/omp-collab-relay --port 7466 &
-          for _ in $(seq 1 20); do
-            curl -fsS http://127.0.0.1:7466/healthz >/dev/null && break
-            sleep 0.25
-          done
-          test "$(curl -fsS http://127.0.0.1:7466/healthz)" = ok
-          curl -fsS http://127.0.0.1:7466/ | grep -q "omp collab"
-          kill %1
+          ./bin/omp-ngrok-relay --version
+          ./bin/omp-ngrok-relay --help | grep -q NGROK_AUTHTOKEN
+          if NGROK_AUTHTOKEN= ./bin/omp-ngrok-relay --port 7466; then
+            echo "started without a token; the tunnel is supposed to be mandatory" >&2
+            exit 1
+          fi
 
   nix:
     runs-on: ubuntu-latest
@@ -54,5 +54,5 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - run: nix flake check --print-build-logs
       - run: nix build .#relay --print-build-logs
-      - run: ./result/bin/omp-collab-relay --version
+      - run: ./result/bin/omp-ngrok-relay --version
       - run: nix build .#container --print-build-logs

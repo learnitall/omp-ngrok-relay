@@ -104,3 +104,21 @@ test("a second host for a live room is rejected with 4009", async () => {
 	expect(await closeCode(`${relay.url}/r/SECONDHOSTroom?role=host`)).toBe(4009);
 	host.ws.close();
 });
+
+// The CLI cannot be smoke-tested without an ngrok token, so the HTTP surface
+// is covered here, against the library.
+test("serves /healthz", async () => {
+	const res = await fetch(`http://127.0.0.1:${relay.port}/healthz`);
+	expect(res.status).toBe(200);
+	expect(await res.text()).toBe("ok");
+});
+
+// Deep links (`/#ws://host/r/<id>.<key>`) reach the server as unknown paths and
+// must render the client shell, not a 404. Holds either way when no client is
+// embedded, which is what a bare `bun test` sees.
+test("unknown paths mirror the client shell", async () => {
+	const base = `http://127.0.0.1:${relay.port}`;
+	const [root, deep] = await Promise.all([fetch(`${base}/`), fetch(`${base}/some/deep/link`)]);
+	expect(deep.status).toBe(root.status);
+	expect(await deep.text()).toBe(await root.text());
+});
