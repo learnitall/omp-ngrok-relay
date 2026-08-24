@@ -205,7 +205,11 @@ podman run --rm --platform linux/amd64 -v "$PWD:/src:ro" docker.io/nixos/nix \
 ```
 
 Set the entry to `lib.fakeHash` first and nix reports the real one. `filter-syscalls false` is only
-needed when the container is emulated: nix cannot load its seccomp filter under qemu.
+needed under emulation: nix cannot load its seccomp filter there.
+
+Emulating a foreign architecture depends on the VM backend, and nix is a demanding guest. On macOS
+an `applehv` machine (Rosetta) runs it; a `libkrun` machine falls back to qemu user-mode, where nix
+segfaults on startup and only plain binaries — the compiled relay included — run.
 
 ## Credits
 
