@@ -35,7 +35,7 @@ bun run build           # compile bin/omp-collab-relay with the client embedded
 Or without cloning anything:
 
 ```sh
-nix run github:<you>/omp-collab-relay
+nix run github:learnitall/omp-ngrok-relay
 ```
 
 Point an omp host at it, from any directory:
