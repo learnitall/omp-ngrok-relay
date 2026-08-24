@@ -15,9 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Pinned to the version nixpkgs ships, so the bun and nix paths compile
+      # the same client and `latest` cannot break the build on its own.
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.13
 
       - run: bun install --frozen-lockfile
 
