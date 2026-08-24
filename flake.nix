@@ -1,5 +1,5 @@
 {
-  description = "Content-blind relay for omp collab sessions";
+  description = "Content-blind relay for omp collab sessions, published through ngrok";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -90,13 +90,13 @@
         # The linux pair came from `nixos/nix` containers under podman, the
         # x86_64 one through qemu emulation on arm64 hardware.
         nodeModulesHash = {
-          aarch64-darwin = "sha256-WQDAQU9d2XFic0T3Rf0ra/B/NKxukFG7yQGGAJ6Gazc=";
+          aarch64-darwin = "sha256-ZbdVOxVrDx/kMZroIehkGL4lYTuo8+IwUoDRGrVAf7k=";
           aarch64-linux = "sha256-mszI37tuvPxbE60f2qgTwmuc21KlEJTnCzNCWSNRSDc=";
           x86_64-linux = "sha256-MwA0SOUCgevosmZbEfGEh49V4olk5QZKWQ5V6AsBmJk=";
         };
 
         nodeModules = pkgs.stdenvNoCC.mkDerivation {
-          pname = "omp-collab-relay-node-modules";
+          pname = "omp-ngrok-relay-node-modules";
           inherit version;
           src = lib.fileset.toSource {
             root = ./.;
@@ -128,7 +128,7 @@
           client = clientDist;
 
           relay = pkgs.stdenvNoCC.mkDerivation {
-            pname = "omp-collab-relay";
+            pname = "omp-ngrok-relay";
             inherit version;
             src = lib.fileset.toSource {
               root = ./.;
@@ -143,23 +143,27 @@
             buildPhase = ''
               runHook preBuild
               export HOME=$TMPDIR
-              ln -s ${nodeModules} node_modules
+              # Copied, not symlinked: through a symlink bun leaves @ngrok/ngrok's
+              # napi prebuild out of the binary and bakes an absolute store path
+              # for it instead, so the tunnel dies on `Cannot require module`.
+              cp -R ${nodeModules} node_modules
+              chmod -R u+w node_modules
               ln -s ${clientDist} dist
               bun scripts/embed-dist.ts
               bun build ./relay.ts --compile --minify \
                 --define BUILD_VERSION="\"${version}\"" \
-                --outfile omp-collab-relay
+                --outfile omp-ngrok-relay
               runHook postBuild
             '';
             installPhase = ''
               runHook preInstall
-              install -Dm755 omp-collab-relay $out/bin/omp-collab-relay
+              install -Dm755 omp-ngrok-relay $out/bin/omp-ngrok-relay
               runHook postInstall
             '';
 
             meta = {
-              description = "Content-blind relay for omp collab sessions";
-              mainProgram = "omp-collab-relay";
+              description = "Content-blind relay for omp collab sessions, published through ngrok";
+              mainProgram = "omp-ngrok-relay";
               license = lib.licenses.mit;
               platforms = lib.platforms.unix;
             };
@@ -172,7 +176,7 @@
           # On macOS, cross-compile instead:
           #   bun build ./relay.ts --compile --target=bun-linux-arm64 ...
           container = pkgs.dockerTools.buildLayeredImage {
-            name = "omp-collab-relay";
+            name = "omp-ngrok-relay";
             tag = version;
             contents = [
               self.packages.${system}.relay
@@ -191,7 +195,7 @@
         };
 
         devShells.default = pkgs.devshell.mkShell {
-          name = "omp-collab-relay";
+          name = "omp-ngrok-relay";
           packages = with pkgs; [
             bun
             typos
