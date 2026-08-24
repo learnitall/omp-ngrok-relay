@@ -87,8 +87,12 @@
         # `bun install` resolves platform-specific optional deps (@ngrok/ngrok
         # ships per-platform napi prebuilds), so the vendored tree — and its
         # hash — differ per system. Add yours with the hash `nix build` reports.
+        # The linux pair came from `nixos/nix` containers under podman, the
+        # x86_64 one through qemu emulation on arm64 hardware.
         nodeModulesHash = {
           aarch64-darwin = "sha256-WQDAQU9d2XFic0T3Rf0ra/B/NKxukFG7yQGGAJ6Gazc=";
+          aarch64-linux = "sha256-mszI37tuvPxbE60f2qgTwmuc21KlEJTnCzNCWSNRSDc=";
+          x86_64-linux = "sha256-MwA0SOUCgevosmZbEfGEh49V4olk5QZKWQ5V6AsBmJk=";
         };
 
         nodeModules = pkgs.stdenvNoCC.mkDerivation {

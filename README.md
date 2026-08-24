@@ -190,6 +190,23 @@ Tests cover the parts that are easy to get quietly wrong: a 4 MiB frame survivin
 with its peerId stamped and bytes intact, targeted frames not leaking to other guests, and the
 `4004`/`4009`/`room-closed` paths.
 
+### Nix hashes
+
+`nodeModulesHash` in [`flake.nix`](./flake.nix) is per system, because `bun install` resolves
+`@ngrok/ngrok`'s napi prebuild for the host platform only. `aarch64-darwin`, `aarch64-linux` and
+`x86_64-linux` are recorded; `x86_64-darwin` is not. Anything else fails at eval with instructions.
+
+A machine of that architecture is not required — a container is enough:
+
+```sh
+podman run --rm --platform linux/amd64 -v "$PWD:/src:ro" docker.io/nixos/nix \
+  sh -c 'nix --extra-experimental-features "nix-command flakes" \
+    --option filter-syscalls false build path:/src#relay'
+```
+
+Set the entry to `lib.fakeHash` first and nix reports the real one. `filter-syscalls false` is only
+needed when the container is emulated: nix cannot load its seccomp filter under qemu.
+
 ## Credits
 
 The protocol, the reference implementation this follows
