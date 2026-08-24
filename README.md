@@ -1,0 +1,184 @@
+# omp-collab-relay
+
+Self-hostable relay for [omp](https://github.com/can1357/oh-my-pi) `/collab` sessions, with the
+browser guest client compiled into the binary and an optional built-in [ngrok](https://ngrok.com)
+endpoint.
+
+`/collab` shares a live omp session with other terminals and browsers. By default that traffic goes
+through `wss://my.omp.sh`. This is a drop-in replacement you run yourself.
+
+```sh
+omp config set collab.relayUrl wss://collab.example.com
+```
+
+## What it does, and what it can't
+
+The relay is a **content-blind switchboard**. Every session payload is sealed with AES-256-GCM by
+the clients before it reaches the socket, so the relay only ever sees:
+
+- room ids and connection counts,
+- opaque ciphertext frames and their sizes,
+- a 4-byte routing prefix naming the target peer.
+
+It cannot read a session, and a bug in it cannot corrupt one — the worst it can do is misroute or
+drop frames.
+
+## Quick start
+
+```sh
+bun install
+bun run client          # build the pinned collab-web guest client into dist/
+bun run build           # compile bin/omp-collab-relay with the client embedded
+./bin/omp-collab-relay  # ws://127.0.0.1:7466
+```
+
+Or without cloning anything:
+
+```sh
+nix run github:<you>/omp-collab-relay
+```
+
+Point an omp host at it, from any directory:
+
+```
+/collab ws://localhost:7466
+```
+
+## Public endpoints
+
+Plain `ws://` is only accepted for localhost — omp's link parser rejects it for any other host — so
+a relay other people can reach needs TLS. Two ways.
+
+**Built-in ngrok.** One process, no reverse proxy, no certificate:
+
+```sh
+export NGROK_AUTHTOKEN=...
+./bin/omp-collab-relay --ngrok --ngrok-url https://collab.example.com
+```
+
+```
+omp-collab-relay 0.1.0 listening on ws://127.0.0.1:7466 (22 embedded client files)
+ngrok endpoint: https://collab.example.com
+  relay:  omp config set collab.relayUrl wss://collab.example.com
+  or one-shot, no config:  /collab wss://collab.example.com
+```
+
+`--ngrok-url` must already be reserved on your ngrok account, and its DNS must point at ngrok
+(`ERR_NGROK_319` otherwise). Drop the flag to take whatever URL your account defaults to.
+
+**Your own TLS.** Run it behind anything that proxies WebSocket upgrades:
+
+```caddy
+collab.example.com {
+    reverse_proxy 127.0.0.1:7466
+}
+```
+
+## Security model
+
+**There is no authentication, by design.** The collab link *is* the credential:
+
+- the link carries `base64url(32-byte AES-256-GCM room key ‖ 16-byte write token)`,
+- the **host** — not the relay — verifies that write token with a timing-safe compare and gates
+  every mutating frame (prompt, abort, agent control) on it,
+- a view-only link is the bare key: it decrypts the session but cannot steer it.
+
+Adding endpoint auth would break every client. `parseCollabLink` normalises links through
+`url.origin`, which drops userinfo, so `wss://user:pass@host/...` silently loses the credentials;
+neither `omp join` nor the browser client can set headers on a WebSocket upgrade; and OAuth needs a
+redirect a WebSocket client cannot perform.
+
+What an open relay actually risks is **abuse** — anyone who learns the hostname can open rooms and
+push bytes through it. That is a rate-limiting problem, so the ngrok endpoint ships with a compiled-in
+traffic policy ([`policy.ts`](./policy.ts)) that caps handshakes per client IP and 404s any path
+outside `/`, `/healthz`, `/r/*`, and the client's static assets. It is deliberately not a CLI flag:
+rules that protect the endpoint should not be swappable out of band.
+
+If you want real access control, put an `oauth` action on `/` only — the browser UI sits behind a
+login while `/r/*` stays open to terminal guests, still protected by the link secret.
+
+## The browser client
+
+`bun run client` builds [`packages/collab-web`](https://github.com/can1357/oh-my-pi/tree/main/packages/collab-web)
+from the oh-my-pi commit pinned in [`client.json`](./client.json) and drops it in `dist/`, where
+`scripts/embed-dist.ts` turns it into `with { type: "file" }` imports that Bun compiles into the
+binary. One artifact, no asset directory to deploy, no path-traversal surface (routing is an
+exact-match map).
+
+The client is not vendored so that the served UI and the wire contract move together and
+deliberately. Skip the step and the relay still works — it just serves nothing at `/`.
+
+## Protocol
+
+Implements the relay half of [omp's collab contract](https://github.com/can1357/oh-my-pi/blob/main/docs/collab.md).
+
+| | |
+|---|---|
+| `GET /r/<roomId>?role=host\|guest` | WebSocket upgrade; `roomId` is `[A-Za-z0-9_-]{10,64}` |
+| `GET /healthz` | liveness |
+| `GET /` | embedded guest client (SPA fallback for unknown paths) |
+| host → relay | `[4B BE peerId][sealed]`; `0` broadcasts, `N` targets guest N; forwarded byte-for-byte |
+| guest → relay | first 4 bytes rewritten to the sender's peerId, forwarded to the host |
+| control → host | `{"t":"peer-joined","peer":N}`, `{"t":"peer-left","peer":N}` |
+| host disconnect | `{"t":"room-closed"}` to every guest, then close `4001` |
+| close codes | `4001` room closed · `4004` no such room · `4009` host already connected · `4029` room full |
+
+Frame shapes and the envelope header come from [`@oh-my-pi/pi-wire`](https://www.npmjs.com/package/@oh-my-pi/pi-wire),
+the same package the clients compile against, so the contract cannot drift silently.
+
+## Options
+
+```
+--port <n>          local listen port (default 7466)
+--hostname <host>   local bind address (default 127.0.0.1)
+--max-guests <n>    per-room guest cap, 0 = unlimited (default 0)
+--ngrok             publish on a public ngrok endpoint (NGROK_AUTHTOKEN required)
+--ngrok-url <url>   reserved ngrok URL, e.g. https://collab.example.com
+--version, --help
+```
+
+## Deployment
+
+**systemd:**
+
+```ini
+[Service]
+Environment=NGROK_AUTHTOKEN=...
+ExecStart=/usr/local/bin/omp-collab-relay --ngrok --ngrok-url https://collab.example.com
+Restart=always
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Container** (Linux hosts; `dockerTools` would otherwise package the host's Mach-O binary):
+
+```sh
+nix build .#container && docker load < result
+docker run -p 7466:7466 -e NGROK_AUTHTOKEN omp-collab-relay:0.1.0
+```
+
+**Releases.** Tagging `v*` cross-compiles binaries for linux and darwin on x64/arm64 (glibc and
+musl), publishes them with checksums, and pushes the container image to ghcr.io.
+
+## Development
+
+```sh
+nix develop     # bun, typos, git, plus `dev`, `client`, and `check` commands
+check           # typecheck, lint, spellcheck, test
+nix fmt         # treefmt: biome, nixfmt, typos
+nix flake check
+```
+
+Tests cover the parts that are easy to get quietly wrong: a 4 MiB frame surviving the payload cap
+with its peerId stamped and bytes intact, targeted frames not leaking to other guests, and the
+`4004`/`4009`/`room-closed` paths.
+
+## Credits
+
+The protocol, the reference implementation this follows
+([`scripts/local-relay.ts`](https://github.com/can1357/oh-my-pi/blob/main/packages/collab-web/scripts/local-relay.ts)),
+and the web client are all from [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi).
+
+MIT.

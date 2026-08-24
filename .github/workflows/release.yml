@@ -1,0 +1,90 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - bun-linux-x64
+          - bun-linux-arm64
+          - bun-linux-x64-musl
+          - bun-linux-arm64-musl
+          - bun-darwin-x64
+          - bun-darwin-arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - name: Build the pinned collab-web client
+        run: bun run client
+
+      - name: Compile ${{ matrix.target }}
+        run: |
+          bun run embed
+          bun build ./relay.ts --compile --minify \
+            --target=${{ matrix.target }} \
+            --define BUILD_VERSION="\"${GITHUB_REF_NAME}\"" \
+            --outfile "out/omp-collab-relay-${{ matrix.target }}"
+          (cd out && sha256sum "omp-collab-relay-${{ matrix.target }}" > "omp-collab-relay-${{ matrix.target }}.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: out/*
+
+  release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            out/*
+
+  container:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+
+      - name: Build image
+        run: nix build .#container --print-build-logs
+
+      - name: Push to ghcr.io
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "${GH_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          # The flake tags the image with the package.json version, which need
+          # not match the git tag; take whatever `docker load` reports.
+          loaded=$(docker load < result | sed -n 's/^Loaded image: //p')
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker tag "${loaded}" "${image}:${GITHUB_REF_NAME}"
+          docker tag "${loaded}" "${image}:latest"
+          docker push "${image}:${GITHUB_REF_NAME}"
+          docker push "${image}:latest"

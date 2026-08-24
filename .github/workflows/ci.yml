@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      # Cache the blobless oh-my-pi clone; only the pinned commit matters.
+      - uses: actions/cache@v4
+        with:
+          path: .cache
+          key: client-${{ hashFiles('client.json') }}
+
+      - name: Build the pinned collab-web client
+        run: bun run client
+
+      - run: bun run typecheck
+      - run: bun run lint
+      - run: bun run test
+      - run: bun run build
+
+      - name: Smoke test the binary
+        run: |
+          ./bin/omp-collab-relay --version
+          ./bin/omp-collab-relay --port 7466 &
+          for _ in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:7466/healthz >/dev/null && break
+            sleep 0.25
+          done
+          test "$(curl -fsS http://127.0.0.1:7466/healthz)" = ok
+          curl -fsS http://127.0.0.1:7466/ | grep -q "omp collab"
+          kill %1
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - run: nix flake check --print-build-logs
+      - run: nix build .#relay --print-build-logs
+      - run: ./result/bin/omp-collab-relay --version
+      - run: nix build .#container --print-build-logs
