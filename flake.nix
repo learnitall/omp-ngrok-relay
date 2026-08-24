@@ -36,6 +36,54 @@
         # Single source of truth; `bun run build` reads git describe instead.
         version = (lib.importJSON ./package.json).version;
 
+        # The pinned collab-web client, shared with `bun run client`.
+        client = lib.importJSON ./client.json;
+
+        # Blobless partial clone + cone-mode sparse checkout: fetchgit sets
+        # `remote.origin.partialclonefilter = blob:none` and checks out only
+        # these directories, so a 235 MB monorepo lands as ~5 MB of source.
+        # The list is the client plus every workspace member bun.lock resolves
+        # its deps to (`@oh-my-pi/pi-{utils,wire}` and pi-utils' own
+        # `pi-natives`), plus the two paths the root manifest names outright:
+        # `python/robomp/web` is a literal workspace entry and `patches` holds
+        # patch files bun reads during resolution. Miss any and bun install
+        # either falls back to the registry or refuses to resolve at all.
+        ompSrc = pkgs.fetchFromGitHub {
+          inherit (client) owner repo;
+          rev = client.commit;
+          inherit (client) sparseCheckout;
+          hash = client.srcHash;
+        };
+
+        # Fixed-output: `bun install` needs the network. The hash covers the
+        # built client, so it also pins bundler output — bump `distHash` when
+        # the pin or nixpkgs' bun moves and nix reports a mismatch.
+        clientDist = pkgs.stdenvNoCC.mkDerivation {
+          pname = "omp-collab-web";
+          version = builtins.substring 0 12 client.commit;
+          src = ompSrc;
+          nativeBuildInputs = [ pkgs.bun ];
+          dontConfigure = true;
+          buildPhase = ''
+            runHook preBuild
+            export HOME=$TMPDIR
+            # Only the client's closure (93 packages, not 394). Frozen would
+            # fail: the workspace members left out of the checkout read as drift.
+            bun install --no-progress --filter ./${client.path}
+            (cd ${client.path} && bun run build)
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            cp -R ${client.path}/dist $out
+            runHook postInstall
+          '';
+
+          outputHashAlgo = "sha256";
+          outputHashMode = "recursive";
+          outputHash = client.distHash;
+        };
+
         # `bun install` resolves platform-specific optional deps (@ngrok/ngrok
         # ships per-platform napi prebuilds), so the vendored tree — and its
         # hash — differ per system. Add yours with the hash `nix build` reports.
@@ -72,9 +120,9 @@
         packages = rec {
           default = relay;
 
-          # The browser client is deliberately absent: building it needs a
-          # network fetch of a pinned oh-my-pi commit (`bun run client`), which
-          # a pure derivation cannot do. The relay serves nothing at `/` here.
+          # The browser guest client, built from the pin in `client.json`.
+          client = clientDist;
+
           relay = pkgs.stdenvNoCC.mkDerivation {
             pname = "omp-collab-relay";
             inherit version;
@@ -92,6 +140,7 @@
               runHook preBuild
               export HOME=$TMPDIR
               ln -s ${nodeModules} node_modules
+              ln -s ${clientDist} dist
               bun scripts/embed-dist.ts
               bun build ./relay.ts --compile --minify \
                 --define BUILD_VERSION="\"${version}\"" \

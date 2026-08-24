@@ -1,5 +1,16 @@
 {
-  "repo": "https://github.com/can1357/oh-my-pi",
+  "owner": "can1357",
+  "repo": "oh-my-pi",
   "commit": "2b66ee69f2493d29dfdf0990b14209a7a96c824b",
-  "path": "packages/collab-web"
+  "path": "packages/collab-web",
+  "sparseCheckout": [
+    "packages/collab-web",
+    "packages/wire",
+    "packages/utils",
+    "packages/natives",
+    "python/robomp/web",
+    "patches"
+  ],
+  "srcHash": "sha256-3nmxopmQr7eF/FjpryfedYOMNkBn+tsSAlgLLfrF+Ms=",
+  "distHash": "sha256-NSBKk9JW8ZpfP++lcjY2FxUQd7qn5h9k5jkx7/tezQE="
 }

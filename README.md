@@ -108,6 +108,20 @@ exact-match map).
 The client is not vendored so that the served UI and the wire contract move together and
 deliberately. Skip the step and the relay still works — it just serves nothing at `/`.
 
+`nix build .#relay` embeds the same client, off the same pin: `fetchFromGitHub` does a blobless
+partial clone (`--filter=blob:none`) with a cone-mode sparse checkout of six directories, which
+turns a 235 MB monorepo into ~10 MB of source, and `nix build .#client` builds just the `dist/`.
+Both are fixed-output derivations, so `client.json` carries their hashes next to the commit:
+
+| field | covers | bump it when |
+|---|---|---|
+| `srcHash` | the sparse checkout | `commit` or `sparseCheckout` changes |
+| `distHash` | the built `dist/` | the pin moves, or nixpkgs' bun bundles differently |
+
+Nix reports the correct hash on mismatch. The sparse list is the client plus the workspace members
+`bun.lock` resolves its dependencies to — leave one out and bun silently falls back to the registry
+or refuses to resolve at all.
+
 ## Protocol
 
 Implements the relay half of [omp's collab contract](https://github.com/can1357/oh-my-pi/blob/main/docs/collab.md).
@@ -169,6 +183,7 @@ nix develop     # bun, typos, git, plus `dev`, `client`, and `check` commands
 check           # typecheck, lint, spellcheck, test
 nix fmt         # treefmt: biome, nixfmt, typos
 nix flake check
+nix build .#client   # just the guest client, into result/
 ```
 
 Tests cover the parts that are easy to get quietly wrong: a 4 MiB frame surviving the payload cap
