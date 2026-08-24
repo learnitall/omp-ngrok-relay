@@ -1,0 +1,9 @@
+node_modules/
+bin/
+dist/
+.cache/
+dist-embed.generated.ts
+*.log
+.DS_Store
+result
+result-*

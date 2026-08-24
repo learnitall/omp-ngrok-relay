@@ -1,0 +1,7 @@
+[files]
+extend-exclude = ["bun.lock", "dist/", "dist-embed.generated.ts", "bin/", ".cache/"]
+
+[default.extend-words]
+# Domain vocabulary, not typos.
+ngrok = "ngrok"
+napi = "napi"

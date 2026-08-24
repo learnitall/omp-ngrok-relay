@@ -1,0 +1,32 @@
+{
+  "name": "omp-collab-relay",
+  "version": "0.1.0",
+  "description": "Content-blind, self-hostable relay for omp collab sessions, with an embedded browser client and optional ngrok endpoint",
+  "license": "MIT",
+  "type": "module",
+  "module": "relay.ts",
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "scripts": {
+    "start": "bun relay.ts",
+    "client": "bun scripts/fetch-client.ts",
+    "embed": "bun scripts/embed-dist.ts",
+    "prebuild": "bun run embed",
+    "build": "bun build ./relay.ts --compile --minify --define BUILD_VERSION=\"\\\"$(git describe --tags --always --dirty 2>/dev/null || echo dev)\\\"\" --outfile bin/omp-collab-relay",
+    "test": "bun run embed && bun test",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "fmt": "biome check --write .",
+    "clean": "rm -rf bin dist .cache dist-embed.generated.ts"
+  },
+  "dependencies": {
+    "@ngrok/ngrok": "^1.7.0",
+    "@oh-my-pi/pi-wire": "^18.0.4"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.15",
+    "@types/bun": "^1.4.0",
+    "typescript": "^5.9.0"
+  }
+}
