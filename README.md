@@ -335,6 +335,32 @@ covered that way: pointing the tunnel at the hosting listener needs a live endpo
 `startNgrok` takes the relay handle instead of a port — there is no port argument to get wrong — and
 the edge's own `role=host` denial backstops it.
 
+### End-to-end, against a real endpoint
+
+`bun test` covers the relay's own rules, but every OAuth and deny rule in `policy.ts` is evaluated by
+ngrok, on ngrok's side of the tunnel — so nothing local can exercise the thing that *is* the access
+control. [`scripts/e2e.ts`](./scripts/e2e.ts) does, against a live endpoint:
+
+```sh
+bun run build
+bun run e2e                                    # NGROK_AUTHTOKEN from the environment
+bun run e2e -- --authtoken-file path/to/token  # or from a file
+```
+
+It publishes an endpoint with an allowlist that admits nobody, then asserts `/healthz` is 200,
+an unlisted path is 404 rather than a redirect, `/` redirects into the OAuth flow, `role=host` is
+403 at the edge, `role=guest` is a redirect, neither role can complete a WebSocket handshake through
+the tunnel, and the hosting bind still accepts `role=host`. Exits non-zero on any failure.
+
+It needs an authtoken, so it is not part of `bun test` and never runs in CI — run it by hand when
+the policy or the listener split changes. Every argument is forwarded to the relay, so pass your own
+`--oauth-allow` and `--ngrok-url` when you want to sign in for real.
+
+One thing a script cannot check: an **authenticated** browser guest's WebSocket upgrade. ngrok's docs
+are silent on whether the `oauth` action passes an upgrade carrying a valid `session` cookie, and the
+whole browser-guest design rests on it. The script prints the console snippet to run after signing
+in; close `4004` means the upgrade reached the room logic.
+
 ### Nix hashes
 
 `nodeModulesHash` in [`flake.nix`](./flake.nix) is per system, because `bun install` resolves

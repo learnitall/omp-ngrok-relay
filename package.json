@@ -16,6 +16,7 @@
     "build": "bun build ./relay.ts --compile --minify --define BUILD_VERSION=\"\\\"$(git describe --tags --always --dirty 2>/dev/null || echo dev)\\\"\" --outfile bin/omp-ngrok-relay",
     "pretest": "bun run embed",
     "test": "bun test",
+    "e2e": "bun scripts/e2e.ts",
     "pretypecheck": "bun run embed",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
