@@ -20,7 +20,7 @@
  * Two loopback-or-narrower listeners share one room map: the hosting bind, which
  * is the only place a `role=host` upgrade is accepted, and the tunnel's own
  * origin, which refuses hosting. The process always publishes itself through an
- * ngrok endpoint, so NGROK_AUTHTOKEN is required.
+ * ngrok endpoint, so an ngrok authtoken is required.
  */
 import { parseArgs } from "node:util";
 import { forward } from "@ngrok/ngrok";
@@ -259,10 +259,11 @@ async function startNgrok(
 	url: string | undefined,
 	policy: object,
 	provider: string,
+	authtoken: string,
 ): Promise<void> {
 	const listener = await forward({
 		addr: `127.0.0.1:${relay.edgePort}`,
-		authtoken_from_env: true,
+		authtoken,
 		domain: url ? new URL(url).hostname : undefined,
 		traffic_policy: JSON.stringify(policy),
 	});
@@ -285,9 +286,12 @@ const HELP = `omp-ngrok-relay ${VERSION} — content-blind relay for omp collab 
   --oauth-provider <p>  ngrok OAuth provider for browser guests (default google)
   --oauth-allow <who>   permitted identity, repeatable or comma-separated:
                         user@example.com for one address, @example.com for a domain
+  --authtoken-file <p>  file holding the ngrok authtoken; wins over NGROK_AUTHTOKEN
   --version, --help
 
-NGROK_AUTHTOKEN and at least one --oauth-allow are required.
+An ngrok authtoken (NGROK_AUTHTOKEN or --authtoken-file) and at least one --oauth-allow are
+required. --authtoken-file wins over the environment, and keeps the token out of the process
+environment and out of the argument list.
 
 Two binds. The hosting bind above accepts role=host and role=guest, unauthenticated — reaching it
 *is* the host's credential, so keep it as narrow as the deployment allows. The tunnel gets its own
@@ -306,6 +310,7 @@ if (import.meta.main) {
 			"ngrok-url": { type: "string" },
 			"oauth-provider": { type: "string", default: "google" },
 			"oauth-allow": { type: "string", multiple: true, default: [] },
+			"authtoken-file": { type: "string" },
 			version: { type: "boolean", default: false },
 			help: { type: "boolean", default: false },
 		},
@@ -319,10 +324,27 @@ if (import.meta.main) {
 		console.log(VERSION);
 		process.exit(0);
 	}
-	// Checked before the port is bound, so a missing token costs nothing.
-	if (!process.env.NGROK_AUTHTOKEN) {
+	// Resolved before the port is bound, so a missing or unreadable token costs
+	// nothing. The file wins over the environment: passing it is the deliberate
+	// choice, and a stale exported token silently overriding it would be worse.
+	let authtoken = process.env.NGROK_AUTHTOKEN ?? "";
+	const tokenFile = values["authtoken-file"];
+	if (tokenFile !== undefined) {
+		try {
+			authtoken = (await Bun.file(tokenFile).text()).trim();
+		} catch (err) {
+			console.error(`--authtoken-file ${tokenFile}: ${err instanceof Error ? err.message : String(err)}`);
+			process.exit(1);
+		}
+		if (authtoken.length === 0) {
+			console.error(`--authtoken-file ${tokenFile}: file is empty`);
+			process.exit(1);
+		}
+	}
+	if (authtoken.length === 0) {
 		console.error(
-			"NGROK_AUTHTOKEN is not set: this relay publishes itself through ngrok and has no local-only mode.",
+			"No ngrok authtoken: set NGROK_AUTHTOKEN or pass --authtoken-file. This relay publishes itself " +
+				"through ngrok and has no local-only mode.",
 		);
 		process.exit(1);
 	}
@@ -363,7 +385,7 @@ if (import.meta.main) {
 	console.log(`  tunnel origin (guests only):  ${relay.edgeUrl}`);
 
 	try {
-		await startNgrok(relay, values["ngrok-url"], policy, provider);
+		await startNgrok(relay, values["ngrok-url"], policy, provider, authtoken);
 	} catch (err) {
 		console.error(`ngrok: ${err instanceof Error ? err.message : String(err)}`);
 		relay.stop();

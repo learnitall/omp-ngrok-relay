@@ -35,7 +35,7 @@ host upgrade, so `role=host` is reachable only on the hosting bind.
 ## Quick start
 
 ```sh
-export NGROK_AUTHTOKEN=...      # https://dashboard.ngrok.com/get-started/your-authtoken
+export NGROK_AUTHTOKEN=...      # or --authtoken-file; see Options
 bun install
 bun run client                  # build the pinned collab-web guest client into dist/
 bun run build                   # compile bin/omp-ngrok-relay with the client embedded
@@ -247,11 +247,18 @@ The relay process does not authenticate anyone: OAuth is enforced by the ngrok e
 --oauth-provider <p>  ngrok OAuth provider for browser guests (default google)
 --oauth-allow <who>   permitted identity, repeatable or comma-separated:
                       user@example.com for one address, @example.com for a domain
+--authtoken-file <p>  file holding the ngrok authtoken; wins over NGROK_AUTHTOKEN
 --version, --help
 ```
 
-`NGROK_AUTHTOKEN` is required; there is no flag for it, since ngrok's own SDK reads it. At least one
-`--oauth-allow` is required too, and both are checked before the port is bound.
+An ngrok authtoken is required, from `NGROK_AUTHTOKEN` or `--authtoken-file`. The file wins when
+both are set: passing it is the deliberate choice, and a stale exported token silently overriding it
+would be the worse failure. A file also keeps the token out of the process environment (readable via
+`/proc/<pid>/environ` on Linux) and out of the argument list. It is read and trimmed at startup, so
+a trailing newline is fine, and an unreadable or empty file is fatal.
+
+At least one `--oauth-allow` is required too. Token, allowlist and policy are all resolved before
+the port is bound, so a misconfiguration costs nothing.
 
 The `@` on a domain entry is not decoration: `@example.com` compiles to
 `endsWith('@example.com')`, which `someone@evil-example.com` cannot satisfy. Entries are validated
@@ -267,8 +274,10 @@ configurable would only create a way to point the tunnel at the wrong listener.
 
 ```ini
 [Service]
-Environment=NGROK_AUTHTOKEN=...
-ExecStart=/usr/local/bin/omp-ngrok-relay --ngrok-url https://collab.example.com --oauth-allow @example.com
+# LoadCredential keeps the token out of the unit file and the environment.
+LoadCredential=ngrok:/etc/omp-ngrok-relay/authtoken
+ExecStart=/usr/local/bin/omp-ngrok-relay --ngrok-url https://collab.example.com \
+  --oauth-allow @example.com --authtoken-file %d/ngrok
 Restart=always
 DynamicUser=yes
 
@@ -292,7 +301,9 @@ docker run -p 127.0.0.1:7466:7466 -e NGROK_AUTHTOKEN \
 The relay dials out, so nothing has to be published for the tunnel to work. Publishing is only for
 reaching the **hosting bind** from outside the container, and then the bind has to be wide — traffic
 through a bridge arrives from the gateway address, not loopback. Bind wide *inside*, publish narrow
-*outside*: `-p 127.0.0.1:7466:7466`, not `-p 7466:7466`.
+*outside*: `-p 127.0.0.1:7466:7466`, not `-p 7466:7466`. Mount a token file with
+`-v /path/token:/token:ro --authtoken-file /token` instead of `-e` if you would rather not put it in
+the container's environment.
 
 **Releases.** Tagging `v*` cross-compiles binaries for linux and darwin on x64/arm64 (glibc and
 musl), publishes them with checksums, and pushes the container image to ghcr.io.
