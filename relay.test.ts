@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
+import { networkInterfaces } from "node:os";
 import { ENVELOPE_HEADER_LENGTH } from "@oh-my-pi/pi-wire";
 import { type RelayHandle, startRelay } from "./relay";
 
@@ -18,8 +19,8 @@ interface Peer {
 	next(): Promise<Frame>;
 }
 
-async function dial(role: "host" | "guest", room = ROOM): Promise<Peer> {
-	const ws = new WebSocket(`${relay.url}/r/${room}?role=${role}`);
+async function dial(role: "host" | "guest", room = ROOM, base = relay.url): Promise<Peer> {
+	const ws = new WebSocket(`${base}/r/${room}?role=${role}`);
 	ws.binaryType = "arraybuffer";
 
 	const queue: Frame[] = [];
@@ -121,4 +122,76 @@ test("unknown paths mirror the client shell", async () => {
 	const [root, deep] = await Promise.all([fetch(`${base}/`), fetch(`${base}/some/deep/link`)]);
 	expect(deep.status).toBe(root.status);
 	expect(await deep.text()).toBe(await root.text());
+});
+
+// The listener a request arrives on is the whole hosting rule, and it has to be:
+// the ngrok agent dials 127.0.0.1, so an edge-forwarded request and a genuinely
+// local one are indistinguishable by source address.
+test("the tunnel's listener refuses role=host but the hosting bind accepts it", async () => {
+	const path = "/r/EDGEHOSTroomx?role=host";
+	const edge = await fetch(`http://127.0.0.1:${relay.edgePort}${path}`);
+	expect(edge.status).toBe(403);
+
+	// 426, not 403: the same request on the hosting bind gets as far as the
+	// upgrade, so the 403 above is the host check and not a routing accident.
+	const local = await fetch(`http://127.0.0.1:${relay.port}${path}`);
+	expect(local.status).toBe(426);
+});
+
+test("a browser guest through the tunnel joins a room on the hosting bind", async () => {
+	const room = "EDGEGUESTroom";
+	const host = await dial("host", room);
+	const guest = await dial("guest", room, relay.edgeUrl);
+	expect(await host.next()).toBe('{"t":"peer-joined","peer":1}');
+
+	// Both listeners share one room map, or the frame never arrives.
+	const payload = frame(0, 64);
+	guest.ws.send(payload);
+	expect(new DataView(((await host.next()) as Uint8Array).buffer).getUint32(0, false)).toBe(1);
+
+	guest.ws.close();
+	host.ws.close();
+});
+
+// Browser guests arrive through the tunnel, so its listener must serve the
+// client shell and the probe the traffic policy leaves unauthenticated.
+test("the tunnel's listener still serves the client and /healthz", async () => {
+	const base = `http://127.0.0.1:${relay.edgePort}`;
+	const [health, shell] = await Promise.all([fetch(`${base}/healthz`), fetch(`${base}/some/deep/link`)]);
+	expect(await health.text()).toBe("ok");
+	expect(shell.status).toBe(200);
+});
+
+const lan = Object.values(networkInterfaces())
+	.flat()
+	.find((i) => i && i.family === "IPv4" && !i.internal)?.address;
+
+// Reaching the hosting bind *is* the host's credential, so widening the bind
+// widens hosting on purpose — that is what makes hosting from outside a
+// container possible. The tunnel's listener still refuses, whatever the bind.
+test.skipIf(!lan)("a wide bind lets a remote peer host, but never through the tunnel", async () => {
+	const wide = startRelay({ port: 0, hostname: "0.0.0.0" });
+	try {
+		const path = "/r/WIDEBINDroomx?role=host";
+		const remote = await fetch(`http://${lan}:${wide.port}${path}`);
+		expect(remote.status).toBe(426);
+
+		const tunnel = await fetch(`http://127.0.0.1:${wide.edgePort}${path}`);
+		expect(tunnel.status).toBe(403);
+	} finally {
+		wide.stop();
+	}
+});
+
+// A guest reaching a wide hosting bind directly has bypassed the edge, so it has
+// bypassed OAuth too. That is inherent to exposing the bind, and the reason the
+// default is loopback.
+test.skipIf(!lan)("a wide bind serves guests without oauth, since oauth lives at the edge", async () => {
+	const wide = startRelay({ port: 0, hostname: "0.0.0.0" });
+	try {
+		const res = await fetch(`http://${lan}:${wide.port}/r/WIDEGUESTroom?role=guest`);
+		expect(res.status).toBe(426);
+	} finally {
+		wide.stop();
+	}
 });

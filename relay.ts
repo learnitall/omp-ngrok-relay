@@ -17,14 +17,16 @@
  * Payloads are AES-256-GCM sealed by the clients; this process never holds a
  * key and never inspects anything past the 4-byte routing prefix.
  *
- * The local listener is only the tunnel's origin: the process always publishes
- * itself through an ngrok endpoint, so NGROK_AUTHTOKEN is required.
+ * Two loopback-or-narrower listeners share one room map: the hosting bind, which
+ * is the only place a `role=host` upgrade is accepted, and the tunnel's own
+ * origin, which refuses hosting. The process always publishes itself through an
+ * ngrok endpoint, so NGROK_AUTHTOKEN is required.
  */
 import { parseArgs } from "node:util";
 import { forward } from "@ngrok/ngrok";
 import { ENVELOPE_HEADER_LENGTH, type RelayControlToGuest, type RelayControlToHost } from "@oh-my-pi/pi-wire";
 import { EMBEDDED_FILES } from "./dist-embed.generated";
-import { TRAFFIC_POLICY } from "./policy";
+import { buildTrafficPolicy } from "./policy";
 
 /** Injected by `bun build --define BUILD_VERSION`; absent in a plain `bun relay.ts` run. */
 declare const BUILD_VERSION: string | undefined;
@@ -58,16 +60,23 @@ interface Room {
 const ROOM_CLOSED: RelayControlToGuest = { t: "room-closed" };
 
 export interface RelayOptions {
+	/** Port of the hosting bind: `role=host` is accepted here and nowhere else. */
 	port?: number;
+	/** Address of the hosting bind. Whoever can reach it can host. */
 	hostname?: string;
 	maxGuests?: number;
+	/** Loopback port the tunnel forwards to; 0 picks one. Hosting is refused there. */
+	edgePort?: number;
 }
 
 export interface RelayHandle {
-	/** ws://host:port — append `/r/<roomId>?role=…` to connect. */
+	/** ws://host:port — the hosting bind; `role=host` is only ever accepted here. */
 	url: string;
 	port: number;
-	/** Closes every room and stops the server. */
+	/** ws://127.0.0.1:port — the tunnel's origin, guests only. */
+	edgeUrl: string;
+	edgePort: number;
+	/** Closes every room and stops both listeners. */
 	stop(): void;
 }
 
@@ -85,95 +94,118 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 		send(ws, JSON.stringify(msg));
 	};
 
-	const server = Bun.serve<SocketData>({
+	/**
+	 * `hosting` is false on the listener the tunnel forwards to, and the socket a
+	 * request arrived on is the whole discriminator. It has to be: the ngrok agent
+	 * runs in this process and dials 127.0.0.1, so an edge-forwarded request and a
+	 * genuinely local one are indistinguishable by source address.
+	 *
+	 * Reachability of the hosting bind is therefore the entire hosting rule —
+	 * `hostname` decides who may host, and the default keeps that to loopback.
+	 */
+	const route = (req: Request, srv: Bun.Server<SocketData>, hosting: boolean): Response | undefined => {
+		const url = new URL(req.url);
+		if (url.pathname === "/healthz") return new Response("ok");
+
+		const match = ROOM_PATH.exec(url.pathname);
+		if (match) {
+			const role = url.searchParams.get("role");
+			if (role !== "host" && role !== "guest") return new Response("not found", { status: 404 });
+			if (role === "host" && !hosting) {
+				return new Response("hosting is not available through the tunnel", { status: 403 });
+			}
+			const data: SocketData = { roomId: match[1]!, role, peerId: 0 };
+			if (srv.upgrade(req, { data })) return undefined;
+			return new Response("websocket upgrade required", { status: 426 });
+		}
+
+		return serveStatic(url.pathname);
+	};
+
+	const websocket: Bun.WebSocketHandler<SocketData> = {
+		maxPayloadLength: MAX_PAYLOAD,
+		// Server pings every 30 s; this only has to outlast that round trip.
+		idleTimeout: 120,
+		open(ws: RelaySocket): void {
+			const { roomId, role } = ws.data;
+			if (role === "host") {
+				if (rooms.has(roomId)) {
+					ws.close(4009, "a host is already connected for this room");
+					return;
+				}
+				rooms.set(roomId, { host: ws, guests: new Map(), nextPeerId: 1 });
+				console.log(`room ${roomId} opened`);
+				return;
+			}
+			const room = rooms.get(roomId);
+			if (!room) {
+				ws.close(4004, "no such room");
+				return;
+			}
+			if (maxGuests > 0 && room.guests.size >= maxGuests) {
+				ws.close(4029, "room is full");
+				return;
+			}
+			const peerId = room.nextPeerId++;
+			ws.data.peerId = peerId;
+			room.guests.set(peerId, ws);
+			control(room.host, { t: "peer-joined", peer: peerId });
+			console.log(`room ${roomId}: peer ${peerId} joined`);
+		},
+		message(ws: RelaySocket, message: string | Buffer): void {
+			if (typeof message === "string") return; // clients never send TEXT
+			const room = rooms.get(ws.data.roomId);
+			if (!room || message.byteLength < ENVELOPE_HEADER_LENGTH) return;
+
+			if (ws.data.role === "host") {
+				const peerId = message.readUInt32BE(0);
+				if (peerId === 0) {
+					for (const guest of room.guests.values()) send(guest, message);
+				} else {
+					const guest = room.guests.get(peerId);
+					if (guest) send(guest, message);
+				}
+				return;
+			}
+			message.writeUInt32BE(ws.data.peerId, 0);
+			send(room.host, message);
+		},
+		close(ws: RelaySocket): void {
+			const { roomId, role, peerId } = ws.data;
+			const room = rooms.get(roomId);
+			if (!room) return;
+
+			if (role === "host") {
+				// Rejected second host: the live room is not ours to tear down.
+				if (room.host !== ws) return;
+				rooms.delete(roomId);
+				for (const guest of room.guests.values()) {
+					control(guest, ROOM_CLOSED);
+					guest.close(4001, "room closed");
+				}
+				console.log(`room ${roomId} closed (${room.guests.size} guests dropped)`);
+				room.guests.clear();
+				return;
+			}
+			if (room.guests.delete(peerId)) {
+				control(room.host, { t: "peer-left", peer: peerId });
+				console.log(`room ${roomId}: peer ${peerId} left`);
+			}
+		},
+	};
+
+	const local = Bun.serve<SocketData>({
 		port: opts.port ?? 7466,
 		hostname: opts.hostname ?? "127.0.0.1",
-		fetch(req, srv): Response | undefined {
-			const url = new URL(req.url);
-			if (url.pathname === "/healthz") return new Response("ok");
-
-			const match = ROOM_PATH.exec(url.pathname);
-			if (match) {
-				const role = url.searchParams.get("role");
-				if (role !== "host" && role !== "guest") return new Response("not found", { status: 404 });
-				const data: SocketData = { roomId: match[1]!, role, peerId: 0 };
-				if (srv.upgrade(req, { data })) return undefined;
-				return new Response("websocket upgrade required", { status: 426 });
-			}
-
-			return serveStatic(url.pathname);
-		},
-		websocket: {
-			maxPayloadLength: MAX_PAYLOAD,
-			// Server pings every 30 s; this only has to outlast that round trip.
-			idleTimeout: 120,
-			open(ws: RelaySocket): void {
-				const { roomId, role } = ws.data;
-				if (role === "host") {
-					if (rooms.has(roomId)) {
-						ws.close(4009, "a host is already connected for this room");
-						return;
-					}
-					rooms.set(roomId, { host: ws, guests: new Map(), nextPeerId: 1 });
-					console.log(`room ${roomId} opened`);
-					return;
-				}
-				const room = rooms.get(roomId);
-				if (!room) {
-					ws.close(4004, "no such room");
-					return;
-				}
-				if (maxGuests > 0 && room.guests.size >= maxGuests) {
-					ws.close(4029, "room is full");
-					return;
-				}
-				const peerId = room.nextPeerId++;
-				ws.data.peerId = peerId;
-				room.guests.set(peerId, ws);
-				control(room.host, { t: "peer-joined", peer: peerId });
-				console.log(`room ${roomId}: peer ${peerId} joined`);
-			},
-			message(ws: RelaySocket, message: string | Buffer): void {
-				if (typeof message === "string") return; // clients never send TEXT
-				const room = rooms.get(ws.data.roomId);
-				if (!room || message.byteLength < ENVELOPE_HEADER_LENGTH) return;
-
-				if (ws.data.role === "host") {
-					const peerId = message.readUInt32BE(0);
-					if (peerId === 0) {
-						for (const guest of room.guests.values()) send(guest, message);
-					} else {
-						const guest = room.guests.get(peerId);
-						if (guest) send(guest, message);
-					}
-					return;
-				}
-				message.writeUInt32BE(ws.data.peerId, 0);
-				send(room.host, message);
-			},
-			close(ws: RelaySocket): void {
-				const { roomId, role, peerId } = ws.data;
-				const room = rooms.get(roomId);
-				if (!room) return;
-
-				if (role === "host") {
-					// Rejected second host: the live room is not ours to tear down.
-					if (room.host !== ws) return;
-					rooms.delete(roomId);
-					for (const guest of room.guests.values()) {
-						control(guest, ROOM_CLOSED);
-						guest.close(4001, "room closed");
-					}
-					console.log(`room ${roomId} closed (${room.guests.size} guests dropped)`);
-					room.guests.clear();
-					return;
-				}
-				if (room.guests.delete(peerId)) {
-					control(room.host, { t: "peer-left", peer: peerId });
-					console.log(`room ${roomId}: peer ${peerId} left`);
-				}
-			},
-		},
+		fetch: (req, srv) => route(req, srv, true),
+		websocket,
+	});
+	// Always loopback: the tunnel's agent runs in this process and dials it locally.
+	const edge = Bun.serve<SocketData>({
+		port: opts.edgePort ?? 0,
+		hostname: "127.0.0.1",
+		fetch: (req, srv) => route(req, srv, false),
+		websocket,
 	});
 
 	const pinger = setInterval(() => {
@@ -183,10 +215,13 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 		}
 	}, PING_INTERVAL_MS);
 
-	const port = server.port ?? 0;
+	const port = local.port ?? 0;
+	const edgePort = edge.port ?? 0;
 	return {
-		url: `ws://${server.hostname}:${port}`,
+		url: `ws://${local.hostname}:${port}`,
 		port,
+		edgeUrl: `ws://${edge.hostname}:${edgePort}`,
+		edgePort,
 		stop(): void {
 			clearInterval(pinger);
 			for (const room of rooms.values()) {
@@ -197,7 +232,8 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 				room.host.close(1001, "relay shutting down");
 			}
 			rooms.clear();
-			server.stop(true);
+			local.stop(true);
+			edge.stop(true);
 		},
 	};
 }
@@ -212,31 +248,53 @@ function serveStatic(pathname: string): Response {
 /**
  * The endpoint is the point of this process, so a failure here is fatal rather
  * than degraded: a relay nobody can reach is not a working relay.
+ *
+ * Takes the handle rather than a port on purpose. Forwarding the tunnel to
+ * `relay.port` instead of `relay.edgePort` would hand remote clients the
+ * listener that accepts `role=host`, silently undoing the same-host rule, so
+ * the choice lives here instead of at the call site.
  */
-async function startNgrok(port: number, url: string | undefined): Promise<void> {
+async function startNgrok(
+	relay: RelayHandle,
+	url: string | undefined,
+	policy: object,
+	provider: string,
+): Promise<void> {
 	const listener = await forward({
-		addr: `127.0.0.1:${port}`,
+		addr: `127.0.0.1:${relay.edgePort}`,
 		authtoken_from_env: true,
 		domain: url ? new URL(url).hostname : undefined,
-		traffic_policy: JSON.stringify(TRAFFIC_POLICY),
+		traffic_policy: JSON.stringify(policy),
 	});
 	const publicUrl = listener.url();
 	if (!publicUrl) throw new Error("ngrok returned no url");
-	const host = new URL(publicUrl).host;
+
 	console.log(`ngrok endpoint: ${publicUrl}`);
-	console.log(`  relay:  omp config set collab.relayUrl wss://${host}`);
-	console.log(`  or one-shot, no config:  /collab wss://${host}`);
+	console.log(`  browser guests:  ${publicUrl}  (sign in with ${provider})`);
+	console.log("  hosting through the tunnel is refused; hosts use the hosting bind.");
+	console.log("  terminal guests (`omp join`) cannot authenticate and will be rejected.");
 }
 
 const HELP = `omp-ngrok-relay ${VERSION} — content-blind relay for omp collab sessions, published through ngrok
 
-  --port <n>          local origin port the tunnel forwards to (default 7466)
-  --hostname <host>   local bind address (default 127.0.0.1)
-  --max-guests <n>    per-room guest cap, 0 = unlimited (default 0)
-  --ngrok-url <url>   reserved ngrok URL, e.g. https://collab.example.com
+  --port <n>            port of the hosting bind (default 7466)
+  --hostname <host>     address of the hosting bind (default 127.0.0.1); whoever can
+                        reach it can host, so 0.0.0.0 opens hosting to that network
+  --max-guests <n>      per-room guest cap, 0 = unlimited (default 0)
+  --ngrok-url <url>     reserved ngrok URL, e.g. https://collab.example.com
+  --oauth-provider <p>  ngrok OAuth provider for browser guests (default google)
+  --oauth-allow <who>   permitted identity, repeatable or comma-separated:
+                        user@example.com for one address, @example.com for a domain
   --version, --help
 
-NGROK_AUTHTOKEN is required. The traffic policy applied to the endpoint is compiled in; see policy.ts.`;
+NGROK_AUTHTOKEN and at least one --oauth-allow are required.
+
+Two binds. The hosting bind above accepts role=host and role=guest, unauthenticated — reaching it
+*is* the host's credential, so keep it as narrow as the deployment allows. The tunnel gets its own
+ephemeral loopback bind and refuses role=host, so hosting never traverses ngrok no matter what the
+edge does. Browser guests coming through the tunnel sign in with the provider; terminal guests
+(omp join) cannot authenticate and cannot connect. The rules are compiled in and only the allowlist
+is a flag; see policy.ts.`;
 
 if (import.meta.main) {
 	const { values } = parseArgs({
@@ -246,6 +304,8 @@ if (import.meta.main) {
 			hostname: { type: "string", default: "127.0.0.1" },
 			"max-guests": { type: "string", default: "0" },
 			"ngrok-url": { type: "string" },
+			"oauth-provider": { type: "string", default: "google" },
+			"oauth-allow": { type: "string", multiple: true, default: [] },
 			version: { type: "boolean", default: false },
 			help: { type: "boolean", default: false },
 		},
@@ -267,6 +327,20 @@ if (import.meta.main) {
 		process.exit(1);
 	}
 
+	// Built before the port is bound, so a malformed allowlist costs nothing. The
+	// policy is the endpoint's only access control, so an invalid one is fatal.
+	const provider = values["oauth-provider"];
+	let policy: object;
+	try {
+		policy = buildTrafficPolicy({
+			provider,
+			allow: values["oauth-allow"].flatMap((v) => v.split(",")).filter((v) => v.length > 0),
+		});
+	} catch (err) {
+		console.error(err instanceof Error ? err.message : String(err));
+		process.exit(1);
+	}
+
 	const relay = startRelay({
 		port: Number(values.port),
 		hostname: values.hostname,
@@ -277,9 +351,19 @@ if (import.meta.main) {
 		`omp-ngrok-relay ${VERSION} listening on ${relay.url}` +
 			(embedded > 0 ? ` (${embedded} embedded client files)` : " (no embedded web client)"),
 	);
+	// A wildcard bind has no address to hand out: the host reaches it on whatever
+	// address routes there, which for a published container port is the loopback
+	// of the machine outside it.
+	const wildcard = values.hostname === "0.0.0.0" || values.hostname === "::";
+	console.log(`  hosting bind:  ${relay.url}${wildcard ? "  (reachable on every address of this host)" : ""}`);
+	if (!wildcard) {
+		console.log(`     omp config set collab.relayUrl ${relay.url}`);
+		console.log(`     or one-shot, no config:  /collab ${relay.url}`);
+	}
+	console.log(`  tunnel origin (guests only):  ${relay.edgeUrl}`);
 
 	try {
-		await startNgrok(relay.port, values["ngrok-url"]);
+		await startNgrok(relay, values["ngrok-url"], policy, provider);
 	} catch (err) {
 		console.error(`ngrok: ${err instanceof Error ? err.message : String(err)}`);
 		relay.stop();

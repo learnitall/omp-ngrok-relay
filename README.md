@@ -5,10 +5,15 @@ browser guest client compiled into the binary and published on an [ngrok](https:
 endpoint.
 
 `/collab` shares a live omp session with other terminals and browsers. By default that traffic goes
-through `wss://my.omp.sh`. This is a drop-in replacement you run yourself.
+through `wss://my.omp.sh`. This is a replacement you run yourself, with two behavioural differences:
+**hosting is restricted to whoever can reach the hosting bind** (loopback by default), and **browser
+guests must sign in through OAuth** while terminal guests (`omp join`) cannot connect at all. See
+[Security model](#security-model).
+
+So the host points omp at the hosting bind, not at the public endpoint:
 
 ```sh
-omp config set collab.relayUrl wss://collab.example.com
+omp config set collab.relayUrl ws://127.0.0.1:7466
 ```
 
 ## What it does, and what it can't
@@ -23,6 +28,10 @@ the clients before it reaches the socket, so the relay only ever sees:
 It cannot read a session, and a bug in it cannot corrupt one — the worst it can do is misroute or
 drop frames.
 
+It also cannot authenticate a browser guest — that is enforced one layer out, at the ngrok edge.
+What it *does* enforce itself is who may host: the tunnel gets its own listener that never accepts a
+host upgrade, so `role=host` is reachable only on the hosting bind.
+
 ## Quick start
 
 ```sh
@@ -30,25 +39,32 @@ export NGROK_AUTHTOKEN=...      # https://dashboard.ngrok.com/get-started/your-a
 bun install
 bun run client                  # build the pinned collab-web guest client into dist/
 bun run build                   # compile bin/omp-ngrok-relay with the client embedded
-./bin/omp-ngrok-relay
+./bin/omp-ngrok-relay --oauth-allow you@gmail.com
 ```
 
 Or without cloning anything:
 
 ```sh
-NGROK_AUTHTOKEN=... nix run github:learnitall/omp-ngrok-relay
+NGROK_AUTHTOKEN=... nix run github:learnitall/omp-ngrok-relay -- --oauth-allow you@gmail.com
 ```
 
-Either way it prints the endpoint and how to point omp at it:
+Either way it prints both doors:
 
 ```
 omp-ngrok-relay 0.1.0 listening on ws://127.0.0.1:7466 (22 embedded client files)
+  hosting bind:  ws://127.0.0.1:7466
+     omp config set collab.relayUrl ws://127.0.0.1:7466
+     or one-shot, no config:  /collab ws://127.0.0.1:7466
+  tunnel origin (guests only):  ws://127.0.0.1:59663
 ngrok endpoint: https://swift-mouse-42.ngrok-free.app
-  relay:  omp config set collab.relayUrl wss://swift-mouse-42.ngrok-free.app
-  or one-shot, no config:  /collab wss://swift-mouse-42.ngrok-free.app
+  browser guests:  https://swift-mouse-42.ngrok-free.app  (sign in with google)
+  hosting through the tunnel is refused; hosts use the hosting bind.
+  terminal guests (`omp join`) cannot authenticate and will be rejected.
 ```
 
-Guests join from a terminal (`omp join`) or from that URL in a browser.
+So: **omp hosts through the hosting bind**, and browser guests join from the ngrok URL after signing
+in as an identity you allowed. **Terminal guests cannot join at all**, and **hosting never traverses
+the tunnel.** See [Security model](#security-model) for both trades.
 
 ## Why the tunnel is not optional
 
@@ -57,9 +73,9 @@ a relay other people can reach needs TLS, which means a certificate, a DNS recor
 proxy in front. ngrok collapses all three into the process itself, so there is one thing to run and
 one thing to trust.
 
-A local-only mode would be a relay nobody can join, so there isn't one: with no `NGROK_AUTHTOKEN`
-the binary exits before it binds a port. The local listener is still there as the tunnel's origin,
-and guests on the same machine can use `ws://127.0.0.1:7466` directly.
+A local-only mode would be a relay nobody can join, so there isn't one: with no authtoken the binary
+exits before it binds a port. The tunnel gets its own ephemeral loopback listener as its origin,
+while `--port`/`--hostname` are the bind omp hosts through.
 
 For a stable address, reserve a domain on your ngrok account and name it:
 
@@ -72,26 +88,99 @@ account defaults to, which changes between runs on the free plan.
 
 ## Security model
 
-**There is no authentication, by design.** The collab link *is* the credential:
+Three separate questions, three separate answers: who may **open** a room, who may **join** one, and
+who may **steer** the session inside it.
 
-- the link carries `base64url(32-byte AES-256-GCM room key ‖ 16-byte write token)`,
-- the **host** — not the relay — verifies that write token with a timing-safe compare and gates
-  every mutating frame (prompt, abort, agent control) on it,
-- a view-only link is the bare key: it decrypts the session but cannot steer it.
+**Steering is gated by the link secret, inside the session.** The collab link carries
+`base64url(32-byte AES-256-GCM room key ‖ 16-byte write token)`; the **host** — not the relay —
+verifies that write token with a timing-safe compare and gates every mutating frame (prompt, abort,
+agent control) on it. A view-only link is the bare key: it decrypts the session but cannot steer it.
+This part is unchanged, and the relay is not involved in it.
 
-Adding endpoint auth would break every client. `parseCollabLink` normalises links through
-`url.origin`, which drops userinfo, so `wss://user:pass@host/...` silently loses the credentials;
-neither `omp join` nor the browser client can set headers on a WebSocket upgrade; and OAuth needs a
-redirect a WebSocket client cannot perform.
+**Opening a room is gated by reachability** — see [below](#hosting-is-gated-by-the-bind).
 
-What an open relay actually risks is **abuse** — anyone who learns the hostname can open rooms and
-push bytes through it. That is a rate-limiting problem, so the ngrok endpoint ships with a compiled-in
-traffic policy ([`policy.ts`](./policy.ts)) that caps handshakes per client IP and 404s any path
-outside `/`, `/healthz`, `/r/*`, and the client's static assets. It is deliberately not a CLI flag:
-rules that protect the endpoint should not be swappable out of band.
+**Joining a room is gated by OAuth.** The compiled-in traffic policy
+([`policy.ts`](./policy.ts)) puts an ngrok `oauth` action in front of `/`, the client's static
+assets, and the `role=guest` WebSocket upgrade, then denies any identity outside `--oauth-allow`
+with a 403. OAuth on its own only proves the visitor has an account with the provider, so the
+allowlist is required and the relay refuses to start without one.
 
-If you want real access control, put an `oauth` action on `/` only — the browser UI sits behind a
-login while `/r/*` stays open to terminal guests, still protected by the link secret.
+### Hosting is gated by the bind
+
+`role=host` is accepted **only on the hosting bind**, and there is no credential for it beyond
+reaching it. The relay binds two listeners over one room map:
+
+| listener | address | accepts |
+|---|---|---|
+| hosting bind | `--hostname:--port`, default `127.0.0.1:7466` | `role=host`, `role=guest`, client, `/healthz` |
+| tunnel origin | ephemeral loopback, not configurable | everything except `role=host` |
+
+The split is the mechanism, and it exists because no address check could do the job. The ngrok agent
+runs inside this process and dials `127.0.0.1`, so a request forwarded from the edge and a request
+from a genuinely local client arrive from the *same source address* — the listener a request landed
+on is the only thing that tells them apart.
+
+So **`--hostname` is the hosting ACL.** The default keeps hosting to the relay's own machine.
+Widening it deliberately widens hosting, which is how you host from outside a container:
+
+```sh
+# in the container: accept hosts from the container network
+docker run -p 127.0.0.1:7466:7466 -e NGROK_AUTHTOKEN \
+  omp-ngrok-relay:0.1.0 --hostname 0.0.0.0 --oauth-allow you@gmail.com
+
+# on the docker host: omp hosts through the published port
+omp config set collab.relayUrl ws://127.0.0.1:7466
+```
+
+Note the `127.0.0.1:` on the published port. Plain `-p 7466:7466` publishes on every interface,
+which hands hosting to the whole network — the bind inside the container is wide *on purpose*, so
+the narrowing has to happen at the publish.
+
+Two layers enforce the rule, and they cover each other:
+
+| layer | mechanism | catches |
+|---|---|---|
+| relay | the tunnel's listener refuses `role=host` | everything, including a tunnel pointed at the wrong listener |
+| edge | traffic policy denies `role=host` with a 403 before the `oauth` action runs | remote host attempts, one hop earlier and cheaper |
+
+**A guest that reaches the hosting bind directly has bypassed OAuth**, because OAuth lives at the
+edge. That is inherent to exposing the bind and is the reason the default is loopback: widen it only
+to a network you would let host anyway.
+
+### What this costs: `omp join`
+
+**Terminal guests no longer work.** `omp join` speaks WebSocket, not OAuth: it cannot follow the
+redirect that starts the flow, and `parseCollabLink` normalises links through `url.origin`, which
+drops userinfo, so it cannot carry a credential to be checked either. Its `role=guest` upgrade gets
+a redirect it will not follow. That is the deliberate trade — authenticated browser guests instead
+of anonymous terminal ones.
+
+Note that `omp join` and a remote host are refused by *different* rules. A terminal guest through
+the tunnel is refused because it cannot do OAuth; a host through the tunnel is refused because
+hosting never traverses the tunnel at all. A terminal guest that can reach the hosting bind still
+works, and is not asked to authenticate.
+
+Gating `/` alone would also have been theater. The browser's data path is the `/r/*` WebSocket,
+which anyone holding the link can open from any origin — putting a login in front of the SPA shell
+while leaving `/r/*` open buys nothing. Authenticating browser guests and rejecting terminal ones
+are the same lever, not two.
+
+### The rest of the policy
+
+An open relay also risks plain **abuse** — anyone who learns the hostname can open rooms and push
+bytes through it — so the policy caps handshakes per client IP and 404s any path outside `/`,
+`/healthz`, `/r/*`, `/ngrok/*`, and the client's static assets. The 404 rule runs *before* the
+`oauth` action, so scanning for unrelated paths gets a flat 404 rather than a redirect naming your
+identity provider.
+
+Only the allowlist and the provider are flags. *Who* may enter is deployment data; the shape of the
+gate is not, and there is no way to start the relay without a gate.
+
+`--oauth-provider` defaults to `google` and uses ngrok's managed OAuth app, which needs no client
+id or secret. `github`, `gitlab`, `microsoft`, `linkedin` and `twitch` also have managed apps. For
+a production deployment you would normally register your own app with the provider; that needs
+`client_id`/`client_secret` on the `oauth` action, which this relay does not expose as flags —
+secrets on a command line are worse than a managed app.
 
 ## The browser client
 
@@ -122,11 +211,19 @@ or refuses to resolve at all.
 
 Implements the relay half of [omp's collab contract](https://github.com/can1357/oh-my-pi/blob/main/docs/collab.md).
 
+The relay binds **two** listeners sharing one room map, differing in exactly one rule: the hosting
+bind that `--hostname`/`--port` name, and an ephemeral loopback one that is the ngrok tunnel's
+origin.
+
+| | hosting bind | tunnel listener |
+|---|---|---|
+| `GET /r/<roomId>?role=host` | upgrade; `roomId` is `[A-Za-z0-9_-]{10,64}` | **403** |
+| `GET /r/<roomId>?role=guest` | upgrade | upgrade, behind OAuth at the edge |
+| `GET /healthz` | `ok` | `ok`, left unauthenticated by the policy |
+| `GET /` | client (SPA fallback for unknown paths) | same, behind OAuth |
+
 | | |
 |---|---|
-| `GET /r/<roomId>?role=host\|guest` | WebSocket upgrade; `roomId` is `[A-Za-z0-9_-]{10,64}` |
-| `GET /healthz` | liveness |
-| `GET /` | embedded guest client (SPA fallback for unknown paths) |
 | host → relay | `[4B BE peerId][sealed]`; `0` broadcasts, `N` targets guest N; forwarded byte-for-byte |
 | guest → relay | first 4 bytes rewritten to the sender's peerId, forwarded to the host |
 | control → host | `{"t":"peer-joined","peer":N}`, `{"t":"peer-left","peer":N}` |
@@ -136,17 +233,33 @@ Implements the relay half of [omp's collab contract](https://github.com/can1357/
 Frame shapes and the envelope header come from [`@oh-my-pi/pi-wire`](https://www.npmjs.com/package/@oh-my-pi/pi-wire),
 the same package the clients compile against, so the contract cannot drift silently.
 
+The relay process does not authenticate anyone: OAuth is enforced by the ngrok edge. What the relay
+*does* enforce is which listener may host, since that is the one thing the edge cannot see.
+
 ## Options
 
 ```
---port <n>          local origin port the tunnel forwards to (default 7466)
---hostname <host>   local bind address (default 127.0.0.1)
---max-guests <n>    per-room guest cap, 0 = unlimited (default 0)
---ngrok-url <url>   reserved ngrok URL, e.g. https://collab.example.com
+--port <n>            port of the hosting bind (default 7466)
+--hostname <host>     address of the hosting bind (default 127.0.0.1); whoever can
+                      reach it can host, so 0.0.0.0 opens hosting to that network
+--max-guests <n>      per-room guest cap, 0 = unlimited (default 0)
+--ngrok-url <url>     reserved ngrok URL, e.g. https://collab.example.com
+--oauth-provider <p>  ngrok OAuth provider for browser guests (default google)
+--oauth-allow <who>   permitted identity, repeatable or comma-separated:
+                      user@example.com for one address, @example.com for a domain
 --version, --help
 ```
 
-`NGROK_AUTHTOKEN` is required; there is no flag for it, since ngrok's own SDK reads it.
+`NGROK_AUTHTOKEN` is required; there is no flag for it, since ngrok's own SDK reads it. At least one
+`--oauth-allow` is required too, and both are checked before the port is bound.
+
+The `@` on a domain entry is not decoration: `@example.com` compiles to
+`endsWith('@example.com')`, which `someone@evil-example.com` cannot satisfy. Entries are validated
+rather than escaped — anything that is not an address or an `@domain` is a startup failure, so a
+crafted entry cannot inject into the policy's CEL.
+
+There is no flag for the tunnel's port — it is an internal loopback detail, and making it
+configurable would only create a way to point the tunnel at the wrong listener.
 
 ## Deployment
 
@@ -155,7 +268,7 @@ the same package the clients compile against, so the contract cannot drift silen
 ```ini
 [Service]
 Environment=NGROK_AUTHTOKEN=...
-ExecStart=/usr/local/bin/omp-ngrok-relay --ngrok-url https://collab.example.com
+ExecStart=/usr/local/bin/omp-ngrok-relay --ngrok-url https://collab.example.com --oauth-allow @example.com
 Restart=always
 DynamicUser=yes
 
@@ -167,8 +280,19 @@ WantedBy=multi-user.target
 
 ```sh
 nix build .#container && docker load < result
-docker run -p 7466:7466 -e NGROK_AUTHTOKEN omp-ngrok-relay:0.1.0
+
+# relay only, nothing published: the container's own omp session hosts
+docker run -e NGROK_AUTHTOKEN omp-ngrok-relay:0.1.0 --oauth-allow you@gmail.com
+
+# to host from the docker host, widen the bind and narrow the publish
+docker run -p 127.0.0.1:7466:7466 -e NGROK_AUTHTOKEN \
+  omp-ngrok-relay:0.1.0 --hostname 0.0.0.0 --oauth-allow you@gmail.com
 ```
+
+The relay dials out, so nothing has to be published for the tunnel to work. Publishing is only for
+reaching the **hosting bind** from outside the container, and then the bind has to be wide — traffic
+through a bridge arrives from the gateway address, not loopback. Bind wide *inside*, publish narrow
+*outside*: `-p 127.0.0.1:7466:7466`, not `-p 7466:7466`.
 
 **Releases.** Tagging `v*` cross-compiles binaries for linux and darwin on x64/arm64 (glibc and
 musl), publishes them with checksums, and pushes the container image to ghcr.io.
@@ -183,9 +307,22 @@ nix flake check
 nix build .#client   # just the guest client, into result/
 ```
 
-Tests cover the parts that are easy to get quietly wrong: a 4 MiB frame surviving the payload cap
-with its peerId stamped and bytes intact, targeted frames not leaking to other guests, and the
-`4004`/`4009`/`room-closed` paths.
+Tests cover the parts that are easy to get quietly wrong.
+
+*Relay:* a 4 MiB frame surviving the payload cap with its peerId stamped and bytes intact, targeted
+frames not leaking to other guests, the `4004`/`4009`/`room-closed` paths, and the hosting boundary
+— `role=host` refused on the tunnel's listener but accepted on the hosting bind, a guest arriving
+through the tunnel joining a room on the hosting bind, and a wide bind letting a remote peer host
+while the tunnel still refuses.
+
+*Policy:* the `@` anchor on domain entries, the `role=host` denial ordering ahead of the `oauth`
+action, `/healthz` being the only exemption left, allowlist entries being rejected rather than
+escaped, and the 404 rule preceding `oauth`.
+
+Each of those was checked by mutating the source and confirming the suite goes red. One line is not
+covered that way: pointing the tunnel at the hosting listener needs a live endpoint to observe, so
+`startNgrok` takes the relay handle instead of a port — there is no port argument to get wrong — and
+the edge's own `role=host` denial backstops it.
 
 ### Nix hashes
 
