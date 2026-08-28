@@ -15,13 +15,17 @@
  * `--oauth-allow` work here too; `--port` and `--oauth-allow` get defaults only
  * when absent. The default allowlist admits nobody, which is what the
  * unauthenticated checks want.
+ *
+ * An optional observation group fires un-normalized requests at the edge to
+ * reveal whether ngrok's target normalisation matches the relay's WHATWG parse.
+ * The observation group does not affect the exit code.
  */
 import { parseArgs } from "node:util";
 
 const forwarded = Bun.argv.slice(2);
 const { values } = parseArgs({
 	args: forwarded,
-	options: { "authtoken-file": { type: "string" } },
+	options: { "authtoken-file": { type: "string" }, port: { type: "string" } },
 	allowPositionals: true,
 	strict: false,
 });
@@ -43,9 +47,11 @@ const ROOM = "E2EPROBEroom";
 const ALLOW = "e2e-nobody@example.com";
 const PORT = "7469";
 
+/** Derived from one parse to avoid mismatch between bind and final check. */
+const port = (values.port as string | undefined) ?? PORT;
 const has = (flag: string): boolean => forwarded.some((a) => a === flag || a.startsWith(`${flag}=`));
 const args = [...forwarded];
-if (!has("--port")) args.push("--port", PORT);
+if (!values.port) args.push("--port", port);
 if (!has("--oauth-allow")) args.push("--oauth-allow", ALLOW);
 
 const relay = Bun.spawn([BINARY, ...args], { stdout: "pipe", stderr: "inherit" });
@@ -88,6 +94,40 @@ function upgrade(url: string): Promise<string> {
 		resolve("timeout");
 	}, 10_000);
 	return promise;
+}
+
+/**
+ * Status code for a request target sent verbatim, bypassing the URL
+ * canonicalisation `fetch` applies. Only the status line is read; the socket is
+ * dropped immediately after.
+ */
+async function rawStatus(publicUrl: string, target: string): Promise<number> {
+	const host = new URL(publicUrl).host;
+	const { promise, resolve } = Promise.withResolvers<number>();
+	const timer = setTimeout(() => resolve(0), 10_000);
+	const done = (status: number): void => {
+		clearTimeout(timer);
+		resolve(status);
+	};
+	const socket = await Bun.connect({
+		hostname: host,
+		port: 443,
+		tls: true,
+		socket: {
+			open(s) {
+				s.write(`GET ${target} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`);
+			},
+			data(s, chunk) {
+				done(Number(new TextDecoder().decode(chunk).match(/^HTTP\/1\.[01] (\d{3})/)?.[1] ?? 0));
+				s.end();
+			},
+			error: () => done(0),
+			close: () => done(0),
+		},
+	});
+	const status = await promise;
+	socket.end();
+	return status;
 }
 
 try {
@@ -134,9 +174,47 @@ try {
 	check("a host cannot upgrade through the edge", tunnelHost !== "open", `handshake ${tunnelHost}`);
 
 	console.log("\nhosting bind, unauthenticated:");
-	const port = forwarded.includes("--port") ? forwarded[forwarded.indexOf("--port") + 1] : PORT;
 	const localHost = await upgrade(`ws://127.0.0.1:${port}/r/${ROOM}?role=host`);
 	check("the hosting bind still accepts role=host", localHost === "open", `handshake ${localHost}`);
+
+	console.log("\nedge parser agreement (observation, non-fatal):");
+
+	// Written straight to a TLS socket, because `fetch` resolves dot-segments in
+	// the URL before sending: through fetch, `/ngrok/../r/<room>` leaves as
+	// `/r/<room>` and ngrok never sees the spelling we are asking about. The
+	// question is what *ngrok* normalises, so the request target has to survive
+	// verbatim.
+	const variants = [
+		[`/ngrok/../r/${ROOM}?role=host`, "dot-segment through the allowlisted /ngrok/ prefix"],
+		[`/./r/${ROOM}?role=host`, "single dot segment"],
+		[`/%2e%2e/r/${ROOM}?role=host`, "percent-encoded dot segments"],
+		[`/r/x/../${ROOM}?role=host`, "dot-segment inside /r/"],
+		[`/healthz/../r/${ROOM}?role=host`, "dot-segment through /healthz"],
+		[`/r/${ROOM}?role=%68ost`, "percent-encoded role value"],
+		[`/r/${ROOM}?%72ole=host`, "percent-encoded role key"],
+		[`/r/${ROOM}?role=guest&role=host`, "duplicate role, guest first"],
+	];
+
+	let caught = 0;
+	for (const [target, label] of variants) {
+		const status = await rawStatus(publicUrl, target as string);
+		// 403 = the policy's host rule matched. 3xx = it did not, and the request
+		// went to oauth instead; only the tunnel's listener would stop it.
+		const verdict =
+			status === 403
+				? "caught by the edge"
+				: status >= 300 && status < 400
+					? "MISSED — reached oauth"
+					: status === 404
+						? "404 by the path allowlist"
+						: `status ${status}`;
+		if (status === 403 || status === 404) caught++;
+		console.log(`  ${String(label).padEnd(48)} ${verdict}`);
+	}
+	console.log(
+		`  -> the edge rejected ${caught}/${variants.length}; any MISSED line is a spelling only the\n` +
+			"     listener split stops, which is why the README calls the edge rule best-effort.",
+	);
 
 	console.log(
 		[

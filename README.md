@@ -136,12 +136,20 @@ Note the `127.0.0.1:` on the published port. Plain `-p 7466:7466` publishes on e
 which hands hosting to the whole network — the bind inside the container is wide *on purpose*, so
 the narrowing has to happen at the publish.
 
-Two layers enforce the rule, and they cover each other:
+The **listener split is the boundary.** The tunnel's listener refuses `role=host` however the URL was
+spelled. The edge rule is an earlier, cheaper rejection — not a second independent layer:
 
-| layer | mechanism | catches |
+| layer | mechanism | catches every spelling? |
 |---|---|---|
-| relay | the tunnel's listener refuses `role=host` | everything, including a tunnel pointed at the wrong listener |
-| edge | traffic policy denies `role=host` with a 403 before the `oauth` action runs | remote host attempts, one hop earlier and cheaper |
+| relay | the tunnel's listener refuses `role=host` | **yes** — it never parses the URL to decide |
+| edge | traffic policy denies `role=host` with a 403 before OAuth | **no** — ngrok's target parsing is undocumented |
+
+ngrok documents `req.url.path` as normalised, and offers `req.url.raw_path` for the un-normalised
+form, but does not say what that normalisation covers or whether query keys and values are
+percent-decoded. So spellings the relay's WHATWG parse resolves to a host upgrade —
+`/./r/<room>?role=host`, `?role=%68ost` — may reach the `oauth` action instead of the 403. Harmless,
+because the listener split stops them regardless; `bun run e2e` observes which ones the edge actually
+catches.
 
 **A guest that reaches the hosting bind directly has bypassed OAuth**, because OAuth lives at the
 edge. That is inherent to exposing the bind and is the reason the default is loopback: widen it only
@@ -263,7 +271,10 @@ the port is bound, so a misconfiguration costs nothing.
 The `@` on a domain entry is not decoration: `@example.com` compiles to
 `endsWith('@example.com')`, which `someone@evil-example.com` cannot satisfy. Entries are validated
 rather than escaped — anything that is not an address or an `@domain` is a startup failure, so a
-crafted entry cannot inject into the policy's CEL.
+crafted entry cannot inject into the policy's CEL. Email addresses are normalized to lowercase at
+build time, and the provider's claim is lowercased by CEL, so matching is case-insensitive. The local
+part accepts letters, digits, and `._%+-`; anything else (including control characters and
+zero-width spaces) is rejected at startup.
 
 There is no flag for the tunnel's port — it is an internal loopback detail, and making it
 configurable would only create a way to point the tunnel at the wrong listener.
@@ -328,12 +339,10 @@ while the tunnel still refuses.
 
 *Policy:* the `@` anchor on domain entries, the `role=host` denial ordering ahead of the `oauth`
 action, `/healthz` being the only exemption left, allowlist entries being rejected rather than
-escaped, and the 404 rule preceding `oauth`.
+escaped, the 404 rule preceding `oauth`, and the deny actions (all three 403/404 statuses are
+asserted, not just the rule names).
 
-Each of those was checked by mutating the source and confirming the suite goes red. One line is not
-covered that way: pointing the tunnel at the hosting listener needs a live endpoint to observe, so
-`startNgrok` takes the relay handle instead of a port — there is no port argument to get wrong — and
-the edge's own `role=host` denial backstops it.
+Each of those was checked by mutating the source and confirming the suite goes red.
 
 ### End-to-end, against a real endpoint
 
@@ -351,6 +360,13 @@ It publishes an endpoint with an allowlist that admits nobody, then asserts `/he
 an unlisted path is 404 rather than a redirect, `/` redirects into the OAuth flow, `role=host` is
 403 at the edge, `role=guest` is a redirect, neither role can complete a WebSocket handshake through
 the tunnel, and the hosting bind still accepts `role=host`. Exits non-zero on any failure.
+
+Then a non-fatal **observation group** answers the one thing the design leaves open: whether ngrok's
+target parsing agrees with the relay's. It writes request targets straight to a TLS socket — `fetch`
+resolves dot-segments before sending, so `/ngrok/../r/<room>` would leave as `/r/<room>` and ngrok
+would never see the spelling in question — and reports, per variant, whether the edge returned the
+403 or let it through to OAuth. It does not affect the exit code, because the answer is currently
+unknown rather than wrong.
 
 It needs an authtoken, so it is not part of `bun test` and never runs in CI — run it by hand when
 the policy or the listener split changes. Every argument is forwarded to the relay, so pass your own

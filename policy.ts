@@ -26,22 +26,48 @@
 /**
  * `role` is absent on asset requests, and indexing a missing key is a CEL
  * error, so the key is tested before it is read.
+ *
+ * Best-effort, and deliberately not the boundary. ngrok documents `req.url.path`
+ * as normalised — there is a separate `req.url.raw_path` — without saying what
+ * that normalises, and says nothing about percent-decoding query keys or values.
+ * So spellings the relay's WHATWG parse resolves to a host upgrade, such as
+ * `/./r/<room>?role=host` or `?role=%68ost`, may reach the `oauth` action
+ * instead of this 403. Harmless, because the tunnel's listener refuses
+ * `role=host` however it was spelled; `scripts/e2e.ts` observes which spellings
+ * the edge actually catches.
  */
 const HOST_UPGRADE =
 	"req.url.path.startsWith('/r/') && 'role' in req.url.query_params && 'host' in req.url.query_params['role']";
 
+/**
+ * ngrok's `oauth` action reserves exactly two endpoint-local paths, `/ngrok/login`
+ * and `/ngrok/logout`. Matched exactly rather than by `/ngrok/` prefix, which also
+ * admitted `/ngrok/../r/<room>?role=host` — a path the relay resolves to a genuine
+ * host upgrade. `req.url.path` excludes the query string, so the documented
+ * `?auth_id=` and `?redirect_path=` forms still match.
+ */
+const NGROK_AUTH_PATHS = "req.url.path == '/ngrok/login' || req.url.path == '/ngrok/logout'";
+
 /** The liveness probe is the one thing the edge serves unauthenticated. */
 const NOT_HEALTHZ = "req.url.path != '/healthz'";
 
-/** Quote characters are excluded so a validated entry cannot terminate a CEL string literal. */
-const ALLOW_EMAIL = /^[^\s@'"\\]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+/**
+ * A positive class, not a negated one: `[^\s@'"\\]` admitted `U+0000` and
+ * `U+200B`, which no provider ever asserts, so such an entry was a permanently
+ * dead allowlist line accepted without complaint. Naming what may appear cannot
+ * be surprised by the next Unicode category, and it still excludes `'`, `"` and
+ * `\` — that exclusion is what stops a validated entry terminating the CEL
+ * string literal it is interpolated into. ASCII-only also keeps `toLowerCase()`
+ * below in exact agreement with CEL's `lowerAscii()`.
+ */
+const ALLOW_EMAIL = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 const ALLOW_DOMAIN = /^@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 const PROVIDER = /^[a-z0-9-]{1,32}$/;
 
 export interface OAuthConfig {
 	/** ngrok provider id; without a client id only providers with a managed app work. */
 	provider: string;
-	/** `user@example.com` for one address, `@example.com` for a whole domain. */
+	/** `user@example.com` for one address, `@example.com` for a whole domain; matched case-insensitively. */
 	allow: string[];
 }
 
@@ -51,16 +77,21 @@ export interface OAuthConfig {
  *
  * The `@` in a domain entry is load-bearing. `endsWith('@example.com')` cannot
  * be satisfied by `someone@evil-example.com`, `endsWith('example.com')` can.
+ *
+ * Both sides are lowercased, because CEL `in` and `endsWith` are case-sensitive
+ * while only some providers normalise the address they assert. Without it,
+ * `--oauth-allow You@Example.COM` starts, publishes an endpoint, and admits
+ * nobody.
  */
 function identityTest(allow: string[]): string {
 	const emails: string[] = [];
 	const domains: string[] = [];
 	for (const entry of allow) {
-		if (ALLOW_DOMAIN.test(entry)) domains.push(entry);
-		else if (ALLOW_EMAIL.test(entry)) emails.push(entry);
+		if (ALLOW_DOMAIN.test(entry)) domains.push(entry.toLowerCase());
+		else if (ALLOW_EMAIL.test(entry)) emails.push(entry.toLowerCase());
 		else throw new Error(`--oauth-allow ${entry}: expected user@example.com or @example.com`);
 	}
-	const email = "actions.ngrok.oauth.identity.email";
+	const email = "actions.ngrok.oauth.identity.email.lowerAscii()";
 	const tests = domains.map((d) => `${email}.endsWith('${d}')`);
 	if (emails.length > 0) tests.unshift(`${email} in [${emails.map((e) => `'${e}'`).join(", ")}]`);
 	return tests.join(" || ");
@@ -96,7 +127,9 @@ export function buildTrafficPolicy(oauth: OAuthConfig): object {
 				name: "allow only the relay, health, the static client, and ngrok's auth paths",
 				expressions: [
 					"!(req.url.path == '/' || req.url.path == '/healthz' || req.url.path.startsWith('/r/') " +
-						"|| req.url.path.startsWith('/ngrok/') " +
+						"|| (" +
+						NGROK_AUTH_PATHS +
+						") " +
 						"|| req.url.path.matches('^/[A-Za-z0-9_.-]+[.](css|js|map|png|svg|ico|webmanifest|txt|xml|woff2?)$'))",
 				],
 				actions: [{ type: "deny", config: { status_code: 404 } }],
