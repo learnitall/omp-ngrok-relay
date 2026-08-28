@@ -218,7 +218,9 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 	const port = local.port ?? 0;
 	const edgePort = edge.port ?? 0;
 	return {
-		url: `ws://${local.hostname}:${port}`,
+		// Bun canonicalises the bind address, so an IPv6 literal comes out bracketed
+		// and the printed url is one the operator can paste.
+		url: `ws://${local.url.host}`,
 		port,
 		edgeUrl: `ws://${edge.hostname}:${edgePort}`,
 		edgePort,
@@ -276,6 +278,70 @@ async function startNgrok(
 	console.log("  terminal guests (`omp join`) cannot authenticate and will be rejected.");
 }
 
+/**
+ * ngrok's ERR_NGROK_105 quotes the supplied authtoken back verbatim, so printing
+ * its message writes the account credential to the log — once per restart under
+ * the systemd recipe. The operator still needs the rest of the message to tell a
+ * bad token from a bad domain, so redact the value rather than drop the error.
+ * Matched on the token itself, never on ngrok's phrasing: a future message could
+ * carry it in different words.
+ */
+export function redactToken(message: string, token: string): string {
+	if (token.length === 0) return message;
+	// A short token would blank out unrelated words wherever it coincidentally
+	// appeared, and an unreadable message is worse than none. A real ngrok token
+	// is ~49 characters, so this only fires on a degenerate one.
+	if (token.length < 8) {
+		return message.includes(token) ? "<redacted: the message contained the authtoken>" : message;
+	}
+	return message.split(token).join("***");
+}
+
+/** How far the hosting bind reaches; see `bindScope`. */
+export type BindScope = "loopback" | "any" | "specific";
+
+/**
+ * `--hostname` is the hosting ACL, so the startup log has to be honest about how
+ * wide it is — and that is a property of the address, not of its spelling: `0`,
+ * `0x0`, `::0` and `2130706433` all bind something a literal comparison misses.
+ * WHATWG's host parser canonicalises every one of them, so classify the parsed
+ * host instead.
+ *
+ * Anything unrecognised is `specific` rather than `loopback`, which also catches
+ * a LAN-only bind: over-warning about a narrow bind is cheap, staying quiet
+ * about a wide one is not.
+ */
+export function bindScope(hostname: string): BindScope {
+	const literal = hostname.includes(":") && !hostname.startsWith("[") ? `[${hostname}]` : hostname;
+	let host: string;
+	try {
+		host = new URL(`http://${literal}`).hostname;
+	} catch {
+		return "specific";
+	}
+	if (host === "0.0.0.0" || host === "[::]") return "any";
+	// Canonical IPv4 is always a dotted quad, so the prefix is the whole of 127/8.
+	// IPv4-mapped IPv6 loopback like ::ffff:127.0.0.1 normalises to [::ffff:7f00:1].
+	if (
+		host === "localhost" ||
+		host === "[::1]" ||
+		host.startsWith("127.") ||
+		(host.startsWith("[::ffff:7f") && host.endsWith(":1]"))
+	) {
+		return "loopback";
+	}
+	return "specific";
+}
+
+/** `null` for anything that is not a whole number in `0..max`; the caller decides how loudly to die. */
+export function parseBoundedInt(raw: string, max: number): number | null {
+	// Digits only (no trimming), so "-1", "1.5", "1e3", "", " 8080 " and "zzz" are
+	// all rejected rather than silently becoming a negative, truncation, NaN, or valid.
+	if (!/^\d+$/.test(raw)) return null;
+	const n = Number(raw);
+	return Number.isSafeInteger(n) && n <= max ? n : null;
+}
+
 const HELP = `omp-ngrok-relay ${VERSION} — content-blind relay for omp collab sessions, published through ngrok
 
   --port <n>            port of the hosting bind (default 7466)
@@ -300,21 +366,48 @@ edge does. Browser guests coming through the tunnel sign in with the provider; t
 (omp join) cannot authenticate and cannot connect. The rules are compiled in and only the allowlist
 is a flag; see policy.ts.`;
 
+/** Every flag this binary accepts, as `parseArgs` hands them back. */
+interface Flags {
+	port: string;
+	hostname: string;
+	"max-guests": string;
+	"ngrok-url"?: string;
+	"oauth-provider": string;
+	"oauth-allow": string[];
+	"authtoken-file"?: string;
+	version: boolean;
+	help: boolean;
+}
+
+/**
+ * `parseArgs` throws on a malformed flag, and an uncaught throw here dumps a
+ * stack trace through the minified bundle. `--port -1` is the common way in: it
+ * reads as a missing argument followed by an unknown short option.
+ */
+function parseFlags(): Flags {
+	try {
+		return parseArgs({
+			args: Bun.argv.slice(2),
+			options: {
+				port: { type: "string", default: "7466" },
+				hostname: { type: "string", default: "127.0.0.1" },
+				"max-guests": { type: "string", default: "0" },
+				"ngrok-url": { type: "string" },
+				"oauth-provider": { type: "string", default: "google" },
+				"oauth-allow": { type: "string", multiple: true, default: [] },
+				"authtoken-file": { type: "string" },
+				version: { type: "boolean", default: false },
+				help: { type: "boolean", default: false },
+			},
+		}).values as Flags;
+	} catch (err) {
+		console.error(`${err instanceof Error ? err.message : String(err)}\n\nRun --help for usage.`);
+		process.exit(1);
+	}
+}
+
 if (import.meta.main) {
-	const { values } = parseArgs({
-		args: Bun.argv.slice(2),
-		options: {
-			port: { type: "string", default: "7466" },
-			hostname: { type: "string", default: "127.0.0.1" },
-			"max-guests": { type: "string", default: "0" },
-			"ngrok-url": { type: "string" },
-			"oauth-provider": { type: "string", default: "google" },
-			"oauth-allow": { type: "string", multiple: true, default: [] },
-			"authtoken-file": { type: "string" },
-			version: { type: "boolean", default: false },
-			help: { type: "boolean", default: false },
-		},
-	});
+	const values = parseFlags();
 
 	if (values.help) {
 		console.log(HELP);
@@ -324,6 +417,21 @@ if (import.meta.main) {
 		console.log(VERSION);
 		process.exit(0);
 	}
+	// `Number("zzz")` is NaN, which Bun.serve reads as "pick any port" and the
+	// guest cap reads as "no cap" — both silent, and both leave the operator's
+	// relayUrl and firewall rules pointing at nothing. Checked before anything
+	// binds, like the token and the allowlist below.
+	const port = parseBoundedInt(values.port, 65535);
+	if (port === null) {
+		console.error(`--port ${values.port}: expected an integer 0-65535`);
+		process.exit(1);
+	}
+	const maxGuests = parseBoundedInt(values["max-guests"], Number.MAX_SAFE_INTEGER);
+	if (maxGuests === null) {
+		console.error(`--max-guests ${values["max-guests"]}: expected a non-negative integer`);
+		process.exit(1);
+	}
+
 	// Resolved before the port is bound, so a missing or unreadable token costs
 	// nothing. The file wins over the environment: passing it is the deliberate
 	// choice, and a stale exported token silently overriding it would be worse.
@@ -356,29 +464,37 @@ if (import.meta.main) {
 	try {
 		policy = buildTrafficPolicy({
 			provider,
-			allow: values["oauth-allow"].flatMap((v) => v.split(",")).filter((v) => v.length > 0),
+			// Trimmed because the help text advertises "comma-separated", and the
+			// natural spelling of that has a space after the comma.
+			allow: values["oauth-allow"]
+				.flatMap((v) => v.split(","))
+				.map((v) => v.trim())
+				.filter((v) => v.length > 0),
 		});
 	} catch (err) {
 		console.error(err instanceof Error ? err.message : String(err));
 		process.exit(1);
 	}
 
-	const relay = startRelay({
-		port: Number(values.port),
-		hostname: values.hostname,
-		maxGuests: Number(values["max-guests"]),
-	});
+	const relay = startRelay({ port, hostname: values.hostname, maxGuests });
 	const embedded = Object.keys(EMBEDDED_FILES).length;
 	console.log(
 		`omp-ngrok-relay ${VERSION} listening on ${relay.url}` +
 			(embedded > 0 ? ` (${embedded} embedded client files)` : " (no embedded web client)"),
 	);
-	// A wildcard bind has no address to hand out: the host reaches it on whatever
-	// address routes there, which for a published container port is the loopback
-	// of the machine outside it.
-	const wildcard = values.hostname === "0.0.0.0" || values.hostname === "::";
-	console.log(`  hosting bind:  ${relay.url}${wildcard ? "  (reachable on every address of this host)" : ""}`);
-	if (!wildcard) {
+	// `--hostname` is the hosting ACL, so a bind wider than loopback is worth
+	// saying out loud. The unspecified address has no address to hand out either:
+	// the host reaches it on whatever routes there, which for a published
+	// container port is the loopback of the machine outside it.
+	const scope = bindScope(values.hostname);
+	const reach =
+		scope === "any"
+			? "  (reachable on every address of this host)"
+			: scope === "specific"
+				? "  (not loopback: whoever can route to it can host)"
+				: "";
+	console.log(`  hosting bind:  ${relay.url}${reach}`);
+	if (scope !== "any") {
 		console.log(`     omp config set collab.relayUrl ${relay.url}`);
 		console.log(`     or one-shot, no config:  /collab ${relay.url}`);
 	}
@@ -387,7 +503,7 @@ if (import.meta.main) {
 	try {
 		await startNgrok(relay, values["ngrok-url"], policy, provider, authtoken);
 	} catch (err) {
-		console.error(`ngrok: ${err instanceof Error ? err.message : String(err)}`);
+		console.error(`ngrok: ${redactToken(err instanceof Error ? err.message : String(err), authtoken)}`);
 		relay.stop();
 		process.exit(1);
 	}

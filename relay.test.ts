@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { networkInterfaces } from "node:os";
 import { ENVELOPE_HEADER_LENGTH } from "@oh-my-pi/pi-wire";
-import { type RelayHandle, startRelay } from "./relay";
+import { bindScope, parseBoundedInt, type RelayHandle, redactToken, startRelay } from "./relay";
 
 const ROOM = "TESTROOMabcdef";
 let relay: RelayHandle;
@@ -194,4 +194,67 @@ test.skipIf(!lan)("a wide bind serves guests without oauth, since oauth lives at
 	} finally {
 		wide.stop();
 	}
+});
+
+test("redactToken removes authtoken from ngrok error messages", () => {
+	const realNgrokMessage =
+		"failed to connect session: The authtoken you specified does not look like a proper ngrok authtoken.\nYour authtoken: SUPERSECRET_9f3a2b1c";
+	const redacted = redactToken(realNgrokMessage, "SUPERSECRET_9f3a2b1c");
+	expect(redacted).not.toContain("SUPERSECRET_9f3a2b1c");
+	expect(redacted).toContain("does not look like a proper ngrok authtoken");
+	expect(redacted).toContain("***");
+});
+
+test("redactToken handles tokens with regex metacharacters literally", () => {
+	const msg = "Your authtoken: aRegex.*match_pattern";
+	const redacted = redactToken(msg, "aRegex.*match_pattern");
+	expect(redacted).toBe("Your authtoken: ***");
+});
+
+test("redactToken leaves unrelated messages untouched", () => {
+	const msg = "something went wrong";
+	const redacted = redactToken(msg, "NOTINTHERE");
+	expect(redacted).toBe(msg);
+});
+
+test("bindScope classifies hostnames correctly", () => {
+	// Loopback addresses
+	expect(bindScope("127.0.0.1")).toBe("loopback");
+	expect(bindScope("127.1.2.3")).toBe("loopback");
+	expect(bindScope("localhost")).toBe("loopback");
+	expect(bindScope("::1")).toBe("loopback");
+	expect(bindScope("[::1]")).toBe("loopback");
+	expect(bindScope("::ffff:127.0.0.1")).toBe("loopback");
+
+	// Unspecified/wildcard addresses
+	expect(bindScope("0.0.0.0")).toBe("any");
+	expect(bindScope("::")).toBe("any");
+	expect(bindScope("::0")).toBe("any");
+	expect(bindScope("0")).toBe("any");
+	expect(bindScope("0:0:0:0:0:0:0:0")).toBe("any");
+
+	// Specific (non-loopback) addresses
+	expect(bindScope("192.168.1.5")).toBe("specific");
+	expect(bindScope("example.com")).toBe("specific");
+	expect(bindScope("2001:db8::1")).toBe("specific");
+	expect(bindScope("1.2.3.4")).toBe("specific");
+	expect(bindScope("invalid..hostname")).toBe("specific");
+});
+
+test("parseBoundedInt accepts valid non-negative integers within bounds", () => {
+	expect(parseBoundedInt("0", 65535)).toBe(0);
+	expect(parseBoundedInt("8080", 65535)).toBe(8080);
+	expect(parseBoundedInt("65535", 65535)).toBe(65535);
+	expect(parseBoundedInt("5", 10)).toBe(5);
+});
+
+test("parseBoundedInt rejects invalid or out-of-bounds values", () => {
+	expect(parseBoundedInt("zzz", 65535)).toBe(null);
+	expect(parseBoundedInt("99999", 65535)).toBe(null);
+	expect(parseBoundedInt("-1", 65535)).toBe(null);
+	expect(parseBoundedInt("1.5", 65535)).toBe(null);
+	expect(parseBoundedInt("1e3", 65535)).toBe(null);
+	expect(parseBoundedInt("", 65535)).toBe(null);
+	expect(parseBoundedInt(" 8080", 65535)).toBe(null);
+	expect(parseBoundedInt("8080 ", 65535)).toBe(null);
 });
