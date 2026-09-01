@@ -1,44 +1,25 @@
 # omp-ngrok-relay
 
-Self-hostable relay for [omp](https://github.com/can1357/oh-my-pi) `/collab` sessions, with the
-browser guest client compiled into the binary and published on an [ngrok](https://ngrok.com)
-endpoint.
+![Overview showing how guests flow through the ngrok network into the relay to connect to a host agent session](./omp-ngrok-relay.svg)
 
-`/collab` shares a live omp session with other terminals and browsers. By default that traffic goes
-through `wss://my.omp.sh`. This is a replacement you run yourself, with two behavioural differences:
-**hosting is restricted to whoever can reach the hosting bind** (loopback by default), and **browser
-guests must sign in through OAuth** while terminal guests (`omp join`) cannot connect at all. See
-[Security model](#security-model).
+Self-hostable relay for [omp](https://github.com/can1357/oh-my-pi) `/collab` sessions. Share your agent session
+with others.
 
-So the host points omp at the hosting bind, not at the public endpoint:
+## How it works
 
-```sh
-omp config set collab.relayUrl ws://127.0.0.1:7466
-```
+Start the relay, launch a new omp agent session, and paste in the `/collab` link from the relay's
+logs. Save the room token from the `/collab` output and give it to others, along with the URL
+to the ngrok endpoint in front of the relay. They'll be able to join your omp session from their
+browser.
 
-## What it does, and what it can't
-
-The relay is a **content-blind switchboard**. Every session payload is sealed with AES-256-GCM by
-the clients before it reaches the socket, so the relay only ever sees:
-
-- room ids and connection counts,
-- opaque ciphertext frames and their sizes,
-- a 4-byte routing prefix naming the target peer.
-
-It cannot read a session, and a bug in it cannot corrupt one — the worst it can do is misroute or
-drop frames.
-
-It also cannot authenticate a browser guest — that is enforced one layer out, at the ngrok edge.
-What it *does* enforce itself is who may host: the tunnel gets its own listener that never accepts a
-host upgrade, so `role=host` is reachable only on the hosting bind.
+omp ships with a public relay at `wss://my.omp.sh`. This project is the same thing, it's just run
+by you on your own machine and protected with ngrok.
 
 ## Quick start
 
 ```sh
-export NGROK_AUTHTOKEN=...      # or --authtoken-file; see Options
-bun install
-bun run client                  # build the pinned collab-web guest client into dist/
-bun run build                   # compile bin/omp-ngrok-relay with the client embedded
+nix build .#relay
+export NGROK_AUTHTOKEN=...      # or --authtoken-file
 ./bin/omp-ngrok-relay --oauth-allow you@gmail.com
 ```
 
@@ -56,69 +37,61 @@ omp-ngrok-relay 0.1.0 listening on ws://127.0.0.1:7466 (22 embedded client files
      omp config set collab.relayUrl ws://127.0.0.1:7466
      or one-shot, no config:  /collab ws://127.0.0.1:7466
   tunnel origin (guests only):  ws://127.0.0.1:59663
-ngrok endpoint: https://swift-mouse-42.ngrok-free.app
-  browser guests:  https://swift-mouse-42.ngrok-free.app  (sign in with google)
+ngrok endpoint: https://<temp>.ngrok-free.app
+  browser guests:  https://<temp>.ngrok-free.app  (sign in with google)
   hosting through the tunnel is refused; hosts use the hosting bind.
   terminal guests (`omp join`) cannot authenticate and will be rejected.
 ```
 
-So: **omp hosts through the hosting bind**, and browser guests join from the ngrok URL after signing
-in as an identity you allowed. **Terminal guests cannot join at all**, and **hosting never traverses
-the tunnel.** See [Security model](#security-model) for both trades.
+- omp host command: `/collab ws://127.0.0.1:7466`
+- guest URL: `https://<temp>.ngrok-free.app`
 
-## Why the tunnel is not optional
+In a new omp session type the `/collab` command from the relay output. You'll get something like this:
 
-Plain `ws://` is only accepted for localhost — omp's link parser rejects it for any other host — so
-a relay other people can reach needs TLS, which means a certificate, a DNS record and a reverse
-proxy in front. ngrok collapses all three into the process itself, so there is one thing to run and
-one thing to trust.
-
-A local-only mode would be a relay nobody can join, so there isn't one: with no authtoken the binary
-exits before it binds a port. The tunnel gets its own ephemeral loopback listener as its origin,
-while `--port`/`--hostname` are the bind omp hosts through.
-
-For a stable address, reserve a domain on your ngrok account and name it:
-
-```sh
-./bin/omp-ngrok-relay --ngrok-url https://collab.example.com
+```
+Collab session started!
+ Join from another terminal: omp join
+"ws://127.0.0.1:7466/r/<token>"
+ or any web browser:
+127.0.0.1:7466/#ws://127.0.0.1:7466/r/<token>
+Anyone with the link can read the session and prompt the agent. Read-only link: /collab view
 ```
 
-Its DNS must point at ngrok (`ERR_NGROK_319` otherwise). Without the flag you get whatever URL your
-account defaults to, which changes between runs on the free plan.
+The bit after the `/r/` in the URLs is the room token.
 
-## Security model
+Send your guests the ngrok endpoint URL from the relay logs (in this example `https://<temp>.ngrok-free.app`)
+and they'll get a page that has a `JOIN LINK` text box. Inside, ask them to enter the following:
 
-Three separate questions, three separate answers: who may **open** a room, who may **join** one, and
-who may **steer** the session inside it.
+```
+wss://<endpoint url>/r/<token>
+```
 
-**Steering is gated by the link secret, inside the session.** The collab link carries
-`base64url(32-byte AES-256-GCM room key ‖ 16-byte write token)`; the **host** — not the relay —
-verifies that write token with a timing-safe compare and gates every mutating frame (prompt, abort,
-agent control) on it. A view-only link is the bare key: it decrypts the session but cannot steer it.
-This part is unchanged, and the relay is not involved in it.
+In this example, it would be:
 
-**Opening a room is gated by reachability** — see [below](#hosting-is-gated-by-the-bind).
+```
+wss://<temp>.ngrok-free.app/r/<token>
+```
 
-**Joining a room is gated by OAuth.** The compiled-in traffic policy
-([`policy.ts`](./policy.ts)) puts an ngrok `oauth` action in front of `/`, the client's static
-assets, and the `role=guest` WebSocket upgrade, then denies any identity outside `--oauth-allow`
-with a 403. OAuth on its own only proves the visitor has an account with the provider, so the
-allowlist is required and the relay refuses to start without one.
+To give them a one-click URL, use the following format:
 
-### Hosting is gated by the bind
+```
+https://<endpoint url>/#wss://<endpoint url>/r/<token>
+```
 
-`role=host` is accepted **only on the hosting bind**, and there is no credential for it beyond
-reaching it. The relay binds two listeners over one room map:
+> Unfortunately the output from the `/collab` session is hardcoded to use whatever address the host agent
+> connected via, so we have to manually construct a join link for guests.
 
-| listener | address | accepts |
-|---|---|---|
-| hosting bind | `--hostname:--port`, default `127.0.0.1:7466` | `role=host`, `role=guest`, client, `/healthz` |
-| tunnel origin | ephemeral loopback, not configurable | everything except `role=host` |
+## Hosts vs Guests
 
-The split is the mechanism, and it exists because no address check could do the job. The ngrok agent
-runs inside this process and dials `127.0.0.1`, so a request forwarded from the edge and a request
-from a genuinely local client arrive from the *same source address* — the listener a request landed
-on is the only thing that tells them apart.
+**Opening a room is gated by reachability**. Use CLI args to control where the relay listens for
+requests to host a new room.
+
+The relay binds two listeners on the local machine:
+
+| listener      | address                                       | accepts                            |
+| ------------- | --------------------------------------------- | ---------------------------------- |
+| hosting bind  | `--hostname:--port`, default `127.0.0.1:7466` | everything                         |
+| tunnel origin | ephemeral loopback, not configurable          | everything except host connections |
 
 So **`--hostname` is the hosting ACL.** The default keeps hosting to the relay's own machine.
 Widening it deliberately widens hosting, which is how you host from outside a container:
@@ -132,117 +105,21 @@ docker run -p 127.0.0.1:7466:7466 -e NGROK_AUTHTOKEN \
 omp config set collab.relayUrl ws://127.0.0.1:7466
 ```
 
-Note the `127.0.0.1:` on the published port. Plain `-p 7466:7466` publishes on every interface,
-which hands hosting to the whole network — the bind inside the container is wide *on purpose*, so
-the narrowing has to happen at the publish.
+**Joining a room is gated by OAuth.** The compiled-in traffic policy
+([`policy.ts`](./policy.ts)) puts an ngrok `oauth` action in front of the public endpoint that
+denies any identity outside `--oauth-allow` with a 403.
 
-The **listener split is the boundary.** The tunnel's listener refuses `role=host` however the URL was
-spelled. The edge rule is an earlier, cheaper rejection — not a second independent layer:
+The upstream browser client from [`packages/collab-web`](https://github.com/can1357/oh-my-pi/tree/main/packages/collab-web)
+is packaged into the relay for guests to use when they connect. It's a set of static assets that are
+served by the relay through the ngrok endpoint. The relay takes care of hooking guests into the
+host agent's session.
 
-| layer | mechanism | catches every spelling? |
-|---|---|---|
-| relay | the tunnel's listener refuses `role=host` | **yes** — it never parses the URL to decide |
-| edge | traffic policy denies `role=host` with a 403 before OAuth | **no** — ngrok's target parsing is undocumented |
+This setup means that terminal guests no longer work. `omp join` isn't compatible with OAuth. That is
+the deliberate trade, authenticated browser guests instead of anonymous terminal ones.
 
-ngrok documents `req.url.path` as normalised, and offers `req.url.raw_path` for the un-normalised
-form, but does not say what that normalisation covers or whether query keys and values are
-percent-decoded. So spellings the relay's WHATWG parse resolves to a host upgrade —
-`/./r/<room>?role=host`, `?role=%68ost` — may reach the `oauth` action instead of the 403. Harmless,
-because the listener split stops them regardless; `bun run e2e` observes which ones the edge actually
-catches.
-
-**A guest that reaches the hosting bind directly has bypassed OAuth**, because OAuth lives at the
-edge. That is inherent to exposing the bind and is the reason the default is loopback: widen it only
-to a network you would let host anyway.
-
-### What this costs: `omp join`
-
-**Terminal guests no longer work.** `omp join` speaks WebSocket, not OAuth: it cannot follow the
-redirect that starts the flow, and `parseCollabLink` normalises links through `url.origin`, which
-drops userinfo, so it cannot carry a credential to be checked either. Its `role=guest` upgrade gets
-a redirect it will not follow. That is the deliberate trade — authenticated browser guests instead
-of anonymous terminal ones.
-
-Note that `omp join` and a remote host are refused by *different* rules. A terminal guest through
-the tunnel is refused because it cannot do OAuth; a host through the tunnel is refused because
-hosting never traverses the tunnel at all. A terminal guest that can reach the hosting bind still
-works, and is not asked to authenticate.
-
-Gating `/` alone would also have been theater. The browser's data path is the `/r/*` WebSocket,
-which anyone holding the link can open from any origin — putting a login in front of the SPA shell
-while leaving `/r/*` open buys nothing. Authenticating browser guests and rejecting terminal ones
-are the same lever, not two.
-
-### The rest of the policy
-
-An open relay also risks plain **abuse** — anyone who learns the hostname can open rooms and push
-bytes through it — so the policy caps handshakes per client IP and 404s any path outside `/`,
-`/healthz`, `/r/*`, `/ngrok/*`, and the client's static assets. The 404 rule runs *before* the
-`oauth` action, so scanning for unrelated paths gets a flat 404 rather than a redirect naming your
-identity provider.
-
-Only the allowlist and the provider are flags. *Who* may enter is deployment data; the shape of the
-gate is not, and there is no way to start the relay without a gate.
-
-`--oauth-provider` defaults to `google` and uses ngrok's managed OAuth app, which needs no client
-id or secret. `github`, `gitlab`, `microsoft`, `linkedin` and `twitch` also have managed apps. For
-a production deployment you would normally register your own app with the provider; that needs
-`client_id`/`client_secret` on the `oauth` action, which this relay does not expose as flags —
-secrets on a command line are worse than a managed app.
-
-## The browser client
-
-`bun run client` builds [`packages/collab-web`](https://github.com/can1357/oh-my-pi/tree/main/packages/collab-web)
-from the oh-my-pi commit pinned in [`client.json`](./client.json) and drops it in `dist/`, where
-`scripts/embed-dist.ts` turns it into `with { type: "file" }` imports that Bun compiles into the
-binary. One artifact, no asset directory to deploy, no path-traversal surface (routing is an
-exact-match map).
-
-The client is not vendored so that the served UI and the wire contract move together and
-deliberately. Skip the step and the relay still works — it just serves nothing at `/`.
-
-`nix build .#relay` embeds the same client, off the same pin: `fetchFromGitHub` does a blobless
-partial clone (`--filter=blob:none`) with a cone-mode sparse checkout of six directories, which
-turns a 235 MB monorepo into ~10 MB of source, and `nix build .#client` builds just the `dist/`.
-Both are fixed-output derivations, so `client.json` carries their hashes next to the commit:
-
-| field | covers | bump it when |
-|---|---|---|
-| `srcHash` | the sparse checkout | `commit` or `sparseCheckout` changes |
-| `distHash` | the built `dist/` | the pin moves, or nixpkgs' bun bundles differently |
-
-Nix reports the correct hash on mismatch. The sparse list is the client plus the workspace members
-`bun.lock` resolves its dependencies to — leave one out and bun silently falls back to the registry
-or refuses to resolve at all.
-
-## Protocol
-
-Implements the relay half of [omp's collab contract](https://github.com/can1357/oh-my-pi/blob/main/docs/collab.md).
-
-The relay binds **two** listeners sharing one room map, differing in exactly one rule: the hosting
-bind that `--hostname`/`--port` name, and an ephemeral loopback one that is the ngrok tunnel's
-origin.
-
-| | hosting bind | tunnel listener |
-|---|---|---|
-| `GET /r/<roomId>?role=host` | upgrade; `roomId` is `[A-Za-z0-9_-]{10,64}` | **403** |
-| `GET /r/<roomId>?role=guest` | upgrade | upgrade, behind OAuth at the edge |
-| `GET /healthz` | `ok` | `ok`, left unauthenticated by the policy |
-| `GET /` | client (SPA fallback for unknown paths) | same, behind OAuth |
-
-| | |
-|---|---|
-| host → relay | `[4B BE peerId][sealed]`; `0` broadcasts, `N` targets guest N; forwarded byte-for-byte |
-| guest → relay | first 4 bytes rewritten to the sender's peerId, forwarded to the host |
-| control → host | `{"t":"peer-joined","peer":N}`, `{"t":"peer-left","peer":N}` |
-| host disconnect | `{"t":"room-closed"}` to every guest, then close `4001` |
-| close codes | `4001` room closed · `4004` no such room · `4009` host already connected · `4029` room full |
-
-Frame shapes and the envelope header come from [`@oh-my-pi/pi-wire`](https://www.npmjs.com/package/@oh-my-pi/pi-wire),
-the same package the clients compile against, so the contract cannot drift silently.
-
-The relay process does not authenticate anyone: OAuth is enforced by the ngrok edge. What the relay
-*does* enforce is which listener may host, since that is the one thing the edge cannot see.
+An open relay also risks plain abuse, since anyone who learns the hostname can open rooms and push
+bytes through it, so the ngrok traffic policy caps handshakes per client IP and 404s any path outside
+those used by the relay.
 
 ## Options
 
@@ -259,154 +136,11 @@ The relay process does not authenticate anyone: OAuth is enforced by the ngrok e
 --version, --help
 ```
 
-An ngrok authtoken is required, from `NGROK_AUTHTOKEN` or `--authtoken-file`. The file wins when
-both are set: passing it is the deliberate choice, and a stale exported token silently overriding it
-would be the worse failure. A file also keeps the token out of the process environment (readable via
-`/proc/<pid>/environ` on Linux) and out of the argument list. It is read and trimmed at startup, so
-a trailing newline is fine, and an unreadable or empty file is fatal.
+An ngrok authtoken is required, from `NGROK_AUTHTOKEN` or `--authtoken-file`. At least one `--oauth-allow` is
+required too. Token, allowlist and policy are all resolved before
 
-At least one `--oauth-allow` is required too. Token, allowlist and policy are all resolved before
-the port is bound, so a misconfiguration costs nothing.
-
-The `@` on a domain entry is not decoration: `@example.com` compiles to
-`endsWith('@example.com')`, which `someone@evil-example.com` cannot satisfy. Entries are validated
-rather than escaped — anything that is not an address or an `@domain` is a startup failure, so a
-crafted entry cannot inject into the policy's CEL. Email addresses are normalized to lowercase at
-build time, and the provider's claim is lowercased by CEL, so matching is case-insensitive. The local
-part accepts letters, digits, and `._%+-`; anything else (including control characters and
-zero-width spaces) is rejected at startup.
-
-There is no flag for the tunnel's port — it is an internal loopback detail, and making it
-configurable would only create a way to point the tunnel at the wrong listener.
-
-## Deployment
-
-**systemd:**
-
-```ini
-[Service]
-# LoadCredential keeps the token out of the unit file and the environment.
-LoadCredential=ngrok:/etc/omp-ngrok-relay/authtoken
-ExecStart=/usr/local/bin/omp-ngrok-relay --ngrok-url https://collab.example.com \
-  --oauth-allow @example.com --authtoken-file %d/ngrok
-Restart=always
-DynamicUser=yes
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**Container** (Linux hosts; `dockerTools` would otherwise package the host's Mach-O binary):
-
-```sh
-nix build .#container && docker load < result
-
-# relay only, nothing published: the container's own omp session hosts
-docker run -e NGROK_AUTHTOKEN omp-ngrok-relay:0.1.0 --oauth-allow you@gmail.com
-
-# to host from the docker host, widen the bind and narrow the publish
-docker run -p 127.0.0.1:7466:7466 -e NGROK_AUTHTOKEN \
-  omp-ngrok-relay:0.1.0 --hostname 0.0.0.0 --oauth-allow you@gmail.com
-```
-
-The relay dials out, so nothing has to be published for the tunnel to work. Publishing is only for
-reaching the **hosting bind** from outside the container, and then the bind has to be wide — traffic
-through a bridge arrives from the gateway address, not loopback. Bind wide *inside*, publish narrow
-*outside*: `-p 127.0.0.1:7466:7466`, not `-p 7466:7466`. Mount a token file with
-`-v /path/token:/token:ro --authtoken-file /token` instead of `-e` if you would rather not put it in
-the container's environment.
-
-**Releases.** Tagging `v*` cross-compiles binaries for linux and darwin on x64/arm64 (glibc and
-musl), publishes them with checksums, and pushes the container image to ghcr.io.
-
-## Development
-
-```sh
-nix develop     # bun, typos, git, plus `dev`, `client`, and `check` commands
-check           # typecheck, lint, spellcheck, test
-nix fmt         # treefmt: biome, nixfmt, typos
-nix flake check
-nix build .#client   # just the guest client, into result/
-```
-
-Tests cover the parts that are easy to get quietly wrong.
-
-*Relay:* a 4 MiB frame surviving the payload cap with its peerId stamped and bytes intact, targeted
-frames not leaking to other guests, the `4004`/`4009`/`room-closed` paths, and the hosting boundary
-— `role=host` refused on the tunnel's listener but accepted on the hosting bind, a guest arriving
-through the tunnel joining a room on the hosting bind, and a wide bind letting a remote peer host
-while the tunnel still refuses.
-
-*Policy:* the `@` anchor on domain entries, the `role=host` denial ordering ahead of the `oauth`
-action, `/healthz` being the only exemption left, allowlist entries being rejected rather than
-escaped, the 404 rule preceding `oauth`, and the deny actions (all three 403/404 statuses are
-asserted, not just the rule names).
-
-Each of those was checked by mutating the source and confirming the suite goes red.
-
-### End-to-end, against a real endpoint
-
-`bun test` covers the relay's own rules, but every OAuth and deny rule in `policy.ts` is evaluated by
-ngrok, on ngrok's side of the tunnel — so nothing local can exercise the thing that *is* the access
-control. [`scripts/e2e.ts`](./scripts/e2e.ts) does, against a live endpoint:
-
-```sh
-bun run build
-bun run e2e                                    # NGROK_AUTHTOKEN from the environment
-bun run e2e -- --authtoken-file path/to/token  # or from a file
-```
-
-It publishes an endpoint with an allowlist that admits nobody, then asserts `/healthz` is 200,
-an unlisted path is 404 rather than a redirect, `/` redirects into the OAuth flow, `role=host` is
-403 at the edge, `role=guest` is a redirect, neither role can complete a WebSocket handshake through
-the tunnel, and the hosting bind still accepts `role=host`. Exits non-zero on any failure.
-
-Then a non-fatal **observation group** answers the one thing the design leaves open: whether ngrok's
-target parsing agrees with the relay's. It writes request targets straight to a TLS socket — `fetch`
-resolves dot-segments before sending, so `/ngrok/../r/<room>` would leave as `/r/<room>` and ngrok
-would never see the spelling in question — and reports, per variant, whether the edge returned the
-403 or let it through to OAuth. It does not affect the exit code, because the answer is currently
-unknown rather than wrong.
-
-It needs an authtoken, so it is not part of `bun test` and never runs in CI — run it by hand when
-the policy or the listener split changes. Every argument is forwarded to the relay, so pass your own
-`--oauth-allow` and `--ngrok-url` when you want to sign in for real.
-
-One thing a script cannot check: an **authenticated** browser guest's WebSocket upgrade. ngrok's docs
-are silent on whether the `oauth` action passes an upgrade carrying a valid `session` cookie, and the
-whole browser-guest design rests on it. The script prints the console snippet to run after signing
-in; close `4004` means the upgrade reached the room logic.
-
-### Nix hashes
-
-`nodeModulesHash` in [`flake.nix`](./flake.nix) is per system, because `bun install` resolves
-`@ngrok/ngrok`'s napi prebuild for the host platform only. `aarch64-darwin`, `aarch64-linux` and
-`x86_64-linux` are recorded; `x86_64-darwin` is not. Anything else fails at eval with instructions.
-
-A machine of that architecture is not required. The hash is a NAR hash of what `bun install`
-produces, so a container of that platform can produce the tree and nix can hash it anywhere:
-
-```sh
-tar -cf - package.json bun.lock |
-  podman run --rm -i --platform linux/amd64 docker.io/oven/bun:1.3.13 \
-    sh -c 'mkdir /w && tar xf - -C /w && cd /w &&
-           bun install --frozen-lockfile 1>&2 && tar -cf - node_modules' |
-  tar -x -C /tmp/nm
-nix hash path --mode nar --type sha256 --sri /tmp/nm/node_modules
-```
-
-Use the bun release nixpkgs pins, or the tree can differ. Running nix in the container works too —
-set the entry to `lib.fakeHash`, `nix build path:/src#relay`, and read the hash it reports — but
-only if the VM backend can emulate that architecture. On macOS an `applehv` podman machine (Rosetta)
-runs nix; a `libkrun` machine falls back to qemu user-mode, where nix segfaults on startup and only
-plain binaries such as bun still run. Under emulation nix also needs `--option filter-syscalls
-false`, since it cannot load its seccomp filter there.
-
-**A stale entry is invisible locally.** A fixed-output derivation is addressed by the hash you
-declare: once a path with that hash is in the store, nix reuses it and never re-runs `bun install`.
-A dependency bump can sit unnoticed for as long as that path survives, and surface only on a fresh
-store — CI, or a rename that changes the derivation name. To force the check, set the entry to
-`lib.fakeHash` or recompute it with the recipe above.
+The `@` on a domain passed to `--oauth-allow` can be used to allow any user from the domain:
+`@example.com` compiles to `endsWith('@example.com')`
 
 ## Credits
 
