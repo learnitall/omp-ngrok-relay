@@ -52,13 +52,35 @@ const port = (values.port as string | undefined) ?? PORT;
 const has = (flag: string): boolean => forwarded.some((a) => a === flag || a.startsWith(`${flag}=`));
 const args = [...forwarded];
 if (!values.port) args.push("--port", port);
-if (!has("--oauth-allow")) args.push("--oauth-allow", ALLOW);
 
-const relay = Bun.spawn([BINARY, ...args], { stdout: "pipe", stderr: "inherit" });
+/** Drops a caller-supplied allowlist, so the anonymous pass really is anonymous. */
+function withoutAllow(argv: string[]): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i] as string;
+		if (arg === "--oauth-allow") {
+			i++;
+			continue;
+		}
+		if (arg.startsWith("--oauth-allow=")) continue;
+		out.push(arg);
+	}
+	return out;
+}
 
-/** Reads stdout until the endpoint line appears, echoing it so failures stay legible. */
-async function endpoint(): Promise<string> {
-	const reader = relay.stdout.getReader();
+interface Relay {
+	url: string;
+	stop(): Promise<void>;
+}
+
+/**
+ * Starts the binary and reads back its endpoint, echoing output so failures stay
+ * legible. ngrok allows one agent session per account, so the passes below run
+ * one at a time and each waits for the previous relay to exit.
+ */
+async function spawnRelay(argv: string[]): Promise<Relay> {
+	const proc = Bun.spawn([BINARY, ...argv], { stdout: "pipe", stderr: "inherit" });
+	const reader = proc.stdout.getReader();
 	const decoder = new TextDecoder();
 	let buffered = "";
 	while (true) {
@@ -68,7 +90,15 @@ async function endpoint(): Promise<string> {
 		process.stdout.write(chunk);
 		buffered += chunk;
 		const url = buffered.match(/ngrok endpoint: (https:\/\/\S+)/)?.[1];
-		if (url) return url;
+		if (url) {
+			return {
+				url,
+				async stop(): Promise<void> {
+					proc.kill();
+					await proc.exited;
+				},
+			};
+		}
 	}
 }
 
@@ -94,6 +124,36 @@ function upgrade(url: string): Promise<string> {
 		resolve("timeout");
 	}, 10_000);
 	return promise;
+}
+
+interface Socket {
+	ws: WebSocket;
+	/** Resolves once the handshake completes, or false if it never does. */
+	opened: Promise<boolean>;
+	/** First TEXT frame the relay sends, or how the socket ended instead. */
+	first: Promise<string>;
+}
+
+/** A socket held open, for the one check that needs a live room rather than a probe. */
+function hold(url: string): Socket {
+	const opened = Promise.withResolvers<boolean>();
+	const first = Promise.withResolvers<string>();
+	const ws = new WebSocket(url);
+	ws.onopen = () => opened.resolve(true);
+	ws.onmessage = (e) => first.resolve(typeof e.data === "string" ? e.data : "binary frame");
+	ws.onerror = () => {
+		opened.resolve(false);
+		first.resolve("refused");
+	};
+	ws.onclose = (e) => {
+		opened.resolve(false);
+		first.resolve(`closed ${e.code}`);
+	};
+	setTimeout(() => {
+		opened.resolve(false);
+		first.resolve("timeout");
+	}, 15_000);
+	return { ws, opened: opened.promise, first: first.promise };
 }
 
 /**
@@ -130,10 +190,11 @@ async function rawStatus(publicUrl: string, target: string): Promise<number> {
 	return status;
 }
 
+const authed = await spawnRelay(has("--oauth-allow") ? args : [...args, "--oauth-allow", ALLOW]);
 try {
-	const publicUrl = await endpoint();
+	const publicUrl = authed.url;
 	const wsUrl = publicUrl.replace(/^https/, "wss");
-	console.log(`\nedge, unauthenticated (${publicUrl}):`);
+	console.log(`\nedge with an allowlist, unauthenticated (${publicUrl}):`);
 
 	// The policy leaves /healthz open so a probe needs no session.
 	const health = await fetch(`${publicUrl}/healthz`, { redirect: "manual" });
@@ -245,7 +306,52 @@ try {
 
 	console.log(`\n${failures === 0 ? "all edge checks passed" : `${failures} edge check(s) failed`}`);
 } finally {
-	relay.kill();
+	await authed.stop();
+}
+
+// The anonymous mode's whole claim is the inverse of everything above: no oauth
+// action, so `omp join` reaches the relay, while the rules that are not oauth
+// stay in force. Only a live endpoint can show that, and only with no allowlist.
+const anon = await spawnRelay(withoutAllow(args));
+try {
+	const publicUrl = anon.url;
+	const wsUrl = publicUrl.replace(/^https/, "wss");
+	console.log(`\nedge with no allowlist, anonymous (${publicUrl}):`);
+
+	const health = await fetch(`${publicUrl}/healthz`, { redirect: "manual" });
+	check("/healthz is still 200", health.status === 200, `got ${health.status}`);
+
+	// With the oauth action gone the shell is served outright; a redirect here
+	// would mean an allowlist leaked into this pass.
+	const shell = await fetch(`${publicUrl}/`, { redirect: "manual" });
+	const html = shell.status === 200 ? await shell.text() : "";
+	check(
+		"/ serves the client instead of an oauth redirect",
+		shell.status === 200 && /<html/i.test(html),
+		`got ${shell.status}${shell.headers.get("location") ? ` -> ${shell.headers.get("location")}` : ""}`,
+	);
+
+	// Dropping oauth must not drop the rules that were never about identity.
+	const unknown = await fetch(`${publicUrl}/wp-login.php`, { redirect: "manual" });
+	check("an unlisted path is still 404", unknown.status === 404, `got ${unknown.status}`);
+	const host = await fetch(`${publicUrl}/r/${ROOM}?role=host`, { redirect: "manual" });
+	check("role=host is still 403 at the edge", host.status === 403, `got ${host.status}`);
+
+	// The headline claim: a terminal guest, which oauth makes impossible, joining
+	// a real room hosted on the hosting bind. The host being told `peer-joined`
+	// is the relay's own room logic answering, through the tunnel, with no login.
+	const roomHost = hold(`ws://127.0.0.1:${port}/r/${ROOM}?role=host`);
+	check("the hosting bind accepts the host", await roomHost.opened, "host handshake failed");
+	const guest = hold(`${wsUrl}/r/${ROOM}?role=guest`);
+	check("a terminal guest upgrades through the anonymous edge", await guest.opened, "guest handshake failed");
+	const joined = await roomHost.first;
+	check("and reaches the room: the host is told it joined", joined === '{"t":"peer-joined","peer":1}', joined);
+	guest.ws.close();
+	roomHost.ws.close();
+
+	console.log(`\n${failures === 0 ? "all edge checks passed" : `${failures} edge check(s) failed`}`);
+} finally {
+	await anon.stop();
 }
 
 process.exit(failures === 0 ? 0 : 1);

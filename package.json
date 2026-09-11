@@ -17,6 +17,7 @@
     "pretest": "bun run embed",
     "test": "bun test",
     "e2e": "bun scripts/e2e.ts",
+    "e2e:local": "bun scripts/local-e2e.ts",
     "pretypecheck": "bun run embed",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",

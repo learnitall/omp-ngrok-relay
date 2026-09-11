@@ -37,17 +37,13 @@ jobs:
       - run: bun run test
       - run: bun run build
 
-      # No NGROK_AUTHTOKEN on a runner, and the relay has no local-only mode,
-      # so the binary can only be checked up to its refusal. The HTTP surface
-      # is covered by the tests, against the library.
-      - name: Smoke test the binary
+      # `bun test` covers the protocol in-process; this covers the artifact CI
+      # actually ships. Needs no NGROK_AUTHTOKEN, since the tunnel is optional.
+      - name: End-to-end against the binary
         run: |
           ./bin/omp-ngrok-relay --version
           ./bin/omp-ngrok-relay --help | grep -q NGROK_AUTHTOKEN
-          if NGROK_AUTHTOKEN= ./bin/omp-ngrok-relay --port 7466; then
-            echo "started without a token; the tunnel is supposed to be mandatory" >&2
-            exit 1
-          fi
+          bun run e2e:local
 
   nix:
     runs-on: ubuntu-latest
