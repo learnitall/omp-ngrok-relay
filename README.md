@@ -13,7 +13,7 @@ to the ngrok endpoint in front of the relay. They'll be able to join your omp se
 browser.
 
 omp ships with a public relay at `wss://my.omp.sh`. This project is the same thing, it's just run
-by you on your own machine and protected with ngrok.
+by you on your own machine, and optionally published and protected with ngrok.
 
 ## Quick start
 
@@ -29,6 +29,14 @@ Or without cloning anything:
 NGROK_AUTHTOKEN=... nix run github:learnitall/omp-ngrok-relay -- --oauth-allow you@gmail.com
 ```
 
+Both the tunnel and OAuth are optional. With no authtoken the relay is local-only, and guests reach
+it however the two binds are reachable — over a LAN, or through a proxy you put in front of
+`--edge-hostname` yourself:
+
+```sh
+./bin/omp-ngrok-relay --edge-hostname 0.0.0.0 --edge-port 7478
+```
+
 Either way it prints both doors:
 
 ```
@@ -42,6 +50,12 @@ ngrok endpoint: https://<temp>.ngrok-free.app
 
 - omp host command: `/collab ws://127.0.0.1:7466`
 - guest URL: `https://<temp>.ngrok-free.app`
+
+Without an authtoken the last line becomes a note instead, and the edge bind is the guest door:
+
+```
+  no ngrok authtoken: local only, guests reach the binds above or nothing at all.
+```
 
 In a new omp session type the `/collab` command from the relay output. You'll get something like this:
 
@@ -102,21 +116,23 @@ docker run -p 127.0.0.1:7466:7466 -e NGROK_AUTHTOKEN \
 omp config set collab.relayUrl ws://127.0.0.1:7466
 ```
 
-**Joining a room is gated by OAuth.** The compiled-in traffic policy
+**Joining a room is gated by OAuth, when you configure it.** The compiled-in traffic policy
 ([`policy.ts`](./policy.ts)) puts an ngrok `oauth` action in front of the public endpoint that
-denies any identity outside `--oauth-allow` with a 403.
+denies any identity outside `--oauth-allow` with a 403. Pass no `--oauth-allow` and both rules are
+dropped: the endpoint is anonymous, and anyone with the URL and a room token can join.
 
 The upstream browser client from [`packages/collab-web`](https://github.com/can1357/oh-my-pi/tree/main/packages/collab-web)
 is packaged into the relay for guests to use when they connect. It's a set of static assets that are
 served by the relay through the ngrok endpoint. The relay takes care of hooking guests into the
 host agent's session.
 
-This setup means that terminal guests no longer work. `omp join` isn't compatible with OAuth. That is
-the deliberate trade, authenticated browser guests instead of anonymous terminal ones.
+OAuth costs you terminal guests: `omp join` isn't compatible with it, so an allowlist buys
+authenticated browser guests at the price of anonymous terminal ones. Drop the allowlist and
+`omp join` works again — for anyone who finds the endpoint.
 
 An open relay also risks plain abuse, since anyone who learns the hostname can open rooms and push
 bytes through it, so the ngrok traffic policy caps handshakes per client IP and 404s any path outside
-those used by the relay.
+those used by the relay. Those two rules apply whether or not OAuth is configured.
 
 ## Options
 
@@ -135,8 +151,10 @@ those used by the relay.
 --version, --help
 ```
 
-An ngrok authtoken is required, from `NGROK_AUTHTOKEN` or `--authtoken-file`. At least one `--oauth-allow` is
-required too. Token, allowlist and policy are all resolved before
+The ngrok authtoken comes from `NGROK_AUTHTOKEN` or `--authtoken-file`, and is what decides whether
+a tunnel is started at all. Without one, `--ngrok-url` and `--oauth-allow` are refused rather than
+silently ignored — there would be no edge to enforce them. Token, allowlist and policy are all
+resolved before anything binds.
 
 OAuth is always Google. The `@` on a domain passed to `--oauth-allow` can be used to allow any user
 from the domain: `@example.com` compiles to `endsWith('@example.com')`.

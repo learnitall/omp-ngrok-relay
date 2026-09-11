@@ -1,30 +1,21 @@
 /**
- * Edge traffic policy, compiled into the binary rather than passed at runtime:
- * the rules are part of what this service *is*, and an operator who can swap
- * them out of band can silently unprotect the endpoint. Only the identity
- * allowlist is a parameter — *who* may enter is deployment data, the shape of
- * the gate is not — and there is no way to start without one.
+ * ngrok traffic policy for protecting the public-side of the relay for guest
+ * connections:
  *
- * Two different doors, because the two roles have different credentials:
+ *   - Allow-list connections to a preset list of expected paths.
+ *   - Deny all connections that contain `role=host`, since we are limiting
+ *     hosting to same-host only.
+ *   - Require OAuth, when an allowlist is configured.
  *
- *   - `role=host` is refused here outright. Hosting is same-host only, and the
- *     relay enforces that structurally by giving the tunnel its own loopback
- *     listener that never accepts a host upgrade (see `startRelay`). This rule
- *     is the earlier, cheaper rejection, not the boundary.
- *   - everything else — `/`, the client's static assets, and the `role=guest`
- *     upgrade — sits behind OAuth plus an identity allowlist. OAuth alone only
- *     proves the visitor has an account with the provider, so the allowlist is
- *     required and the relay refuses to start without one.
+ * OAuth costs terminal guests: `omp join` speaks WebSocket, not OAuth, so it
+ * can't follow the redirect that starts the flow. An empty allowlist is the
+ * deliberate other side of that trade — an anonymous endpoint that terminal
+ * guests can reach, protected by the path and hosting rules alone.
  *
- * The cost is terminal guests. `omp join` speaks WebSocket, not OAuth: it
- * cannot follow the redirect that starts the flow, and `parseCollabLink`
- * normalises links through `url.origin`, which drops userinfo, so it cannot
- * carry a credential to be checked either. That is the accepted trade —
- * authenticated browser guests instead of anonymous terminal ones.
+ * TODO:add another operating mode for the relay that allows terminal guests to
+ * join by proxying WebSocket connections through an OAuth-authenticated ngrok
+ * tunnel.
  */
-
-/** The liveness probe is the one thing the edge serves unauthenticated. */
-const NOT_HEALTHZ = "req.url.path != '/healthz'";
 
 /**
  * Regex strings to match against different --oauth-allow options.
@@ -36,18 +27,17 @@ const ALLOW_DOMAIN = /^@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 const PROVIDER = "google";
 
 /**
- * Operator data reaching a CEL expression is validated, not escaped: an entry
- * that is not exactly an address or an `@domain` is a startup failure.
+ * Return a CEL expression that matches against the set of emails and domains
+ * provided.
  *
- * The `@` in a domain entry is load-bearing. `endsWith('@example.com')` cannot
- * be satisfied by `someone@evil-example.com`, `endsWith('example.com')` can.
- *
- * Both sides are lowercased, because CEL `in` and `endsWith` are case-sensitive
- * while only some providers normalise the address they assert. Without it,
- * `--oauth-allow You@Example.COM` starts, publishes an endpoint, and admits
- * nobody.
+ * The strings provided are matched as either a single-email or a domain based on the
+ * `ALLOW_EMAIL` and `ALLOW_DOMAIN` regex strings. An error is thrown if a string matches neither.
  */
-function identityTest(allow: string[]): string {
+function getAllowedOAuthIdentities(allow: string[]): string {
+	// Callers gate on this, but an empty list here would compile to `!()` — invalid
+	// CEL that ngrok rejects at best and admits everyone at worst.
+	if (allow.length === 0) throw new Error("--oauth-allow: allowlist is empty");
+
 	const emails: string[] = [];
 	const domains: string[] = [];
 	for (const entry of allow) {
@@ -67,9 +57,30 @@ function identityTest(allow: string[]): string {
 	return tests.join(" || ");
 }
 
+/** An empty `allow` publishes an anonymous endpoint: no oauth action, no identity rule. */
 export function buildTrafficPolicy(allow: string[]): object {
-	if (allow.length === 0) throw new Error("--oauth-allow is required: OAuth with no allowlist admits everyone");
-	const allowed = identityTest(allow);
+	const oauth =
+		allow.length === 0
+			? []
+			: [
+					{
+						name: "require oauth on everything the browser touches",
+						// The probe has to answer an unauthenticated GET or it stops being a
+						// liveness check; every other path goes through the provider.
+						expressions: ["req.url.path != '/healthz'"],
+						actions: [{ type: "oauth", config: { provider: PROVIDER } }],
+					},
+					// OAuth only proves the visitor has an account with the provider; without
+					// this rule "authenticated" means "has a Google account", which is not
+					// access control.
+					{
+						name: "allow only the configured identities",
+						// Both must hold to deny: expressions are ANDed, so exempting the probe
+						// here too keeps it reachable without an identity claim to test.
+						expressions: ["req.url.path != '/healthz'", `!(${getAllowedOAuthIdentities(allow)})`],
+						actions: [{ type: "deny", config: { status_code: 403 } }],
+					},
+				];
 
 	return {
 		on_http_request: [
@@ -111,19 +122,7 @@ export function buildTrafficPolicy(allow: string[]): object {
 				// redirect it cannot complete.
 				actions: [{ type: "deny", config: { status_code: 403 } }],
 			},
-			{
-				name: "require oauth on everything the browser touches",
-				expressions: [NOT_HEALTHZ],
-				actions: [{ type: "oauth", config: { provider: PROVIDER } }],
-			},
-			// OAuth only proves the visitor has an account with the provider; without
-			// this rule "authenticated" means "has a Google account", which is not
-			// access control.
-			{
-				name: "allow only the configured identities",
-				expressions: [NOT_HEALTHZ, `!(${allowed})`],
-				actions: [{ type: "deny", config: { status_code: 403 } }],
-			},
+			...oauth,
 		],
 	};
 }

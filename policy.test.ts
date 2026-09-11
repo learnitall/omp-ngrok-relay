@@ -83,8 +83,19 @@ test("the whole /ngrok/ prefix is admitted, not an enumerated set", () => {
 	expect(expr).not.toContain("req.url.path == '/ngrok/");
 });
 
-test("an empty allowlist is refused", () => {
-	expect(() => rules([])).toThrow(/--oauth-allow is required/);
+/**
+ * An empty allowlist is the anonymous mode, not a misconfiguration — but it must drop
+ * the identity deny with the oauth action. Keeping the deny with no oauth action would
+ * evaluate an identity claim that cannot exist and lock everyone out.
+ */
+test("an empty allowlist drops both oauth rules and keeps the rest in order", () => {
+	const anonymous = rules([]).map((r) => r.name);
+	expect(anonymous).toEqual(
+		rules(["@example.com"])
+			.map((r) => r.name)
+			.slice(0, 3),
+	);
+	expect(anonymous).toHaveLength(3);
 });
 
 /**

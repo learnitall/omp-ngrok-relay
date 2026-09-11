@@ -21,8 +21,10 @@
  *
  * Two listeners, loopback by default, share one room map: the hosting bind, which
  * is the only place a `role=host` upgrade is accepted, and the edge bind, which
- * refuses hosting and is what the ngrok tunnel forwards to. The process always
- * publishes itself through an ngrok endpoint, so an ngrok authtoken is required.
+ * refuses hosting and is what the ngrok tunnel forwards to. The tunnel is started
+ * only when an ngrok authtoken is supplied; without one the relay is whatever its
+ * two binds are reachable from, and `--edge-hostname` is how you put your own
+ * proxy in front of guests.
  */
 import { parseArgs } from "node:util";
 import { forward } from "@ngrok/ngrok";
@@ -289,10 +291,6 @@ export function edgeDialAddress(guestUrl: string): string {
 	return `${hostname === "0.0.0.0" || hostname === "[::]" ? "127.0.0.1" : hostname}:${port}`;
 }
 
-/**
- * The endpoint is the point of this process, so a failure here is fatal rather
- * than degraded: a relay nobody can reach is not a working relay.
- */
 async function startNgrok(
 	relay: RelayHandle,
 	url: string | undefined,
@@ -338,7 +336,7 @@ export function parseBoundedInt(raw: string, max: number): number | null {
 	return Number.isSafeInteger(n) && n <= max ? n : null;
 }
 
-const HELP = `omp-ngrok-relay ${VERSION} — content-blind relay for omp collab sessions, published through ngrok
+const HELP = `omp-ngrok-relay ${VERSION} — content-blind relay for omp collab sessions
 
   --port <n>            port of the hosting bind (default 7466)
   --hostname <host>     address of the hosting bind (default 127.0.0.1); whoever can
@@ -353,16 +351,19 @@ const HELP = `omp-ngrok-relay ${VERSION} — content-blind relay for omp collab 
   --authtoken-file <p>  file holding the ngrok authtoken; wins over NGROK_AUTHTOKEN
   --version, --help
 
-An ngrok authtoken (NGROK_AUTHTOKEN or --authtoken-file) and at least one --oauth-allow are
-required. --authtoken-file wins over the environment, and keeps the token out of the process
-environment and out of the argument list.
+The ngrok tunnel is optional. Given an authtoken (NGROK_AUTHTOKEN or --authtoken-file) the relay
+publishes the edge bind through ngrok; without one it starts local-only, and --ngrok-url and
+--oauth-allow are refused because nothing would enforce them. --authtoken-file wins over the
+environment, and keeps the token out of the process environment and out of the argument list.
 
-Two binds. The hosting bind above accepts role=host and role=guest, unauthenticated — reaching it
-*is* the host's credential, so keep it as narrow as the deployment allows. The tunnel gets its own
-ephemeral loopback bind and refuses role=host, so hosting never traverses ngrok no matter what the
-edge does. Browser guests coming through the tunnel sign in with the provider; terminal guests
-(omp join) cannot authenticate and cannot connect. The rules are compiled in and only the allowlist
-is a flag; see policy.ts.`;
+OAuth is optional too, and lives at the ngrok edge. Each --oauth-allow admits one google identity;
+with none the endpoint is anonymous — anyone holding the URL and a room token can join, and
+terminal guests (omp join) work again, which OAuth otherwise makes impossible.
+
+Two binds. The hosting bind accepts role=host and role=guest, unauthenticated — reaching it *is*
+the host's credential, so keep it as narrow as the deployment allows. The edge bind refuses
+role=host, so hosting never traverses the tunnel no matter what the edge does. Those rules are
+compiled in and only the allowlist is a flag; see policy.ts.`;
 
 /** Every flag this binary accepts, as `parseArgs` hands them back. */
 interface Flags {
@@ -443,29 +444,34 @@ if (import.meta.main) {
 			process.exit(1);
 		}
 	}
-	if (authtoken.length === 0) {
-		console.error(
-			"No ngrok authtoken: set NGROK_AUTHTOKEN or pass --authtoken-file. This relay publishes itself " +
-				"through ngrok and has no local-only mode.",
-		);
-		process.exit(1);
-	}
 
-	// Built before the port is bound, so a malformed allowlist costs nothing. The
-	// policy is the endpoint's only access control, so an invalid one is fatal.
-	// Trimmed because the help text advertises "comma-separated", and the natural
-	// spelling of that has a space after the comma.
 	const allow = values["oauth-allow"]
 		.flatMap((v) => v.split(","))
 		.map((v) => v.trim())
 		.filter((v) => v.length > 0);
 
-	let policy: object;
-	try {
-		policy = buildTrafficPolicy(allow);
-	} catch (err) {
-		console.error(err instanceof Error ? err.message : String(err));
-		process.exit(1);
+	// The traffic policy is the tunnel's entire access control, so it is built and
+	// validated before anything binds. No token means no tunnel and no policy, which
+	// leaves the edge-only flags with nothing to enforce them: refuse rather than
+	// run on with an allowlist the operator believes is in force.
+	let policy: object | undefined;
+	if (authtoken.length === 0) {
+		const orphaned = [values["ngrok-url"] !== undefined && "--ngrok-url", allow.length > 0 && "--oauth-allow"].filter(
+			(f): f is string => f !== false,
+		);
+		if (orphaned.length > 0) {
+			console.error(
+				`${orphaned.join(" and ")}: no ngrok tunnel to enforce them. Set NGROK_AUTHTOKEN or pass --authtoken-file.`,
+			);
+			process.exit(1);
+		}
+	} else {
+		try {
+			policy = buildTrafficPolicy(allow);
+		} catch (err) {
+			console.error(err instanceof Error ? err.message : String(err));
+			process.exit(1);
+		}
 	}
 
 	const relay = startRelay({
@@ -481,12 +487,19 @@ if (import.meta.main) {
 	console.log(`     or one-shot, no config:  /collab ${relay.hostUrl}`);
 	console.log(`  edge bind (guests only):  ${relay.guestUrl}`);
 
-	try {
-		await startNgrok(relay, values["ngrok-url"], policy, authtoken);
-	} catch (err) {
-		console.error(`ngrok: ${redactToken(err instanceof Error ? err.message : String(err), authtoken)}`);
-		relay.stop();
-		process.exit(1);
+	if (policy === undefined) {
+		console.log("  no ngrok authtoken: local only, guests reach the binds above or nothing at all.");
+	} else {
+		try {
+			await startNgrok(relay, values["ngrok-url"], policy, authtoken);
+		} catch (err) {
+			console.error(`ngrok: ${redactToken(err instanceof Error ? err.message : String(err), authtoken)}`);
+			relay.stop();
+			process.exit(1);
+		}
+		if (allow.length === 0) {
+			console.log("  no --oauth-allow: the endpoint is anonymous, anyone with a room token can join.");
+		}
 	}
 
 	const shutdown = (): void => {
