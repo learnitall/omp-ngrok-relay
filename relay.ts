@@ -4,17 +4,19 @@
  *
  * Contract (see docs/collab.md in oh-my-pi):
  *   - GET /r/<roomId>?role=host|guest  -> websocket upgrade
- *   - the host creates the room; a second host is closed with 4009,
- *     a guest for a missing room with 4004, an over-capacity guest with 4029
- *   - host BINARY frame: [4B BE peerId][sealed]; peerId 0 broadcasts to every
- *     guest, peerId N targets guest N. Forwarded byte-for-byte.
+ *   - the host creates the room
+ *   - a second host is closed with 4009
+ *   - a guest for a missing room is closed with 4004
+ *   - an over-capacity guest is closed with 4029
+ *   - host BINARY frame: [4B BE peerId][sealed]. peerId 0 broadcasts to every
+ *     guest, peerId N targets guest N.
  *   - guest BINARY frame: first 4 bytes rewritten to the sender's peerId,
  *     then forwarded to the host.
  *   - TEXT control to the host: {"t":"peer-joined","peer":N} / {"t":"peer-left","peer":N}
  *   - host disconnect: TEXT {"t":"room-closed"} to every guest, close 4001,
  *     room dropped.
  *
- * Payloads are AES-256-GCM sealed by the clients; this process never holds a
+ * Payloads are AES-256-GCM sealed by the clients. The relay never holds a
  * key and never inspects anything past the 4-byte routing prefix.
  *
  * Two loopback-or-narrower listeners share one room map: the hosting bind, which
@@ -28,14 +30,12 @@ import { ENVELOPE_HEADER_LENGTH, type RelayControlToGuest, type RelayControlToHo
 import { EMBEDDED_FILES } from "./dist-embed.generated";
 import { buildTrafficPolicy } from "./policy";
 
-/** Injected by `bun build --define BUILD_VERSION`; absent in a plain `bun relay.ts` run. */
+/** Injected by `bun build --define BUILD_VERSION`. Absent in a plain `bun relay.ts` run. */
 declare const BUILD_VERSION: string | undefined;
 const VERSION = typeof BUILD_VERSION === "string" ? BUILD_VERSION : "dev";
 
 const ROOM_PATH = /^\/r\/([A-Za-z0-9_-]{10,64})$/;
-/** Frames carry snapshot chunks and inline images; the 16 MiB default is too tight. */
 const MAX_PAYLOAD = 32 * 1024 * 1024;
-/** A peer this far behind is never catching up; drop it instead of buffering for it. */
 const BACKPRESSURE_LIMIT = 8 * 1024 * 1024;
 const PING_INTERVAL_MS = 30_000;
 
@@ -45,7 +45,7 @@ const INDEX_HTML = EMBEDDED_FILES["/index.html"];
 interface SocketData {
 	roomId: string;
 	role: "host" | "guest";
-	/** Assigned on open for guests; the host stays 0. */
+	/** Assigned on open for guests. The host stays 0. */
 	peerId: number;
 }
 
@@ -96,26 +96,32 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 
 	/**
 	 * `hosting` is false on the listener the tunnel forwards to, and the socket a
-	 * request arrived on is the whole discriminator. It has to be: the ngrok agent
-	 * runs in this process and dials 127.0.0.1, so an edge-forwarded request and a
-	 * genuinely local one are indistinguishable by source address.
+	 * request arrived on is the whole discriminator. The ngrok agent runs in this
+	 * process and dials 127.0.0.1, so an edge-forwarded request and a genuinely
+	 * local one are indistinguishable by source address.
 	 *
-	 * Reachability of the hosting bind is therefore the entire hosting rule —
-	 * `hostname` decides who may host, and the default keeps that to loopback.
+	 * Reachability of the hosting bind is therefore the entire hosting rule.
+	 * The `opts.hostname` decides who may host, and the default keeps that to loopback.
 	 */
 	const route = (req: Request, srv: Bun.Server<SocketData>, hosting: boolean): Response | undefined => {
 		const url = new URL(req.url);
-		if (url.pathname === "/healthz") return new Response("ok");
+		if (url.pathname === "/healthz") {
+			return new Response("ok");
+		}
 
 		const match = ROOM_PATH.exec(url.pathname);
 		if (match) {
 			const role = url.searchParams.get("role");
-			if (role !== "host" && role !== "guest") return new Response("not found", { status: 404 });
+			if (role !== "host" && role !== "guest") {
+				return new Response("not found", { status: 404 });
+			}
 			if (role === "host" && !hosting) {
 				return new Response("hosting is not available through the tunnel", { status: 403 });
 			}
 			const data: SocketData = { roomId: match[1]!, role, peerId: 0 };
-			if (srv.upgrade(req, { data })) return undefined;
+			if (srv.upgrade(req, { data })) {
+				return undefined;
+			}
 			return new Response("websocket upgrade required", { status: 426 });
 		}
 
@@ -124,7 +130,7 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 
 	const websocket: Bun.WebSocketHandler<SocketData> = {
 		maxPayloadLength: MAX_PAYLOAD,
-		// Server pings every 30 s; this only has to outlast that round trip.
+		// Server pings every 30 s, so this only has to outlast that round trip.
 		idleTimeout: 120,
 		open(ws: RelaySocket): void {
 			const { roomId, role } = ws.data;
@@ -137,47 +143,65 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 				console.log(`room ${roomId} opened`);
 				return;
 			}
+
 			const room = rooms.get(roomId);
 			if (!room) {
 				ws.close(4004, "no such room");
 				return;
 			}
+
 			if (maxGuests > 0 && room.guests.size >= maxGuests) {
 				ws.close(4029, "room is full");
 				return;
 			}
+
 			const peerId = room.nextPeerId++;
 			ws.data.peerId = peerId;
 			room.guests.set(peerId, ws);
 			sendControlMessage(room.host, { t: "peer-joined", peer: peerId });
+
 			console.log(`room ${roomId}: peer ${peerId} joined`);
 		},
 		message(ws: RelaySocket, message: string | Buffer): void {
-			if (typeof message === "string") return; // clients never send TEXT
+			if (typeof message === "string") {
+				return; // clients never send TEXT
+			}
+
 			const room = rooms.get(ws.data.roomId);
-			if (!room || message.byteLength < ENVELOPE_HEADER_LENGTH) return;
+			if (!room || message.byteLength < ENVELOPE_HEADER_LENGTH) {
+				return;
+			}
 
 			if (ws.data.role === "host") {
 				const peerId = message.readUInt32BE(0);
 				if (peerId === 0) {
-					for (const guest of room.guests.values()) send(guest, message);
+					for (const guest of room.guests.values()) {
+						send(guest, message);
+					}
 				} else {
 					const guest = room.guests.get(peerId);
-					if (guest) send(guest, message);
+					if (guest) {
+						send(guest, message);
+					}
 				}
 				return;
 			}
+
 			message.writeUInt32BE(ws.data.peerId, 0);
 			send(room.host, message);
 		},
 		close(ws: RelaySocket): void {
 			const { roomId, role, peerId } = ws.data;
 			const room = rooms.get(roomId);
-			if (!room) return;
+			if (!room) {
+				return;
+			}
 
 			if (role === "host") {
 				// Rejected second host: the live room is not ours to tear down.
-				if (room.host !== ws) return;
+				if (room.host !== ws) {
+					return;
+				}
 				rooms.delete(roomId);
 				for (const guest of room.guests.values()) {
 					sendControlMessage(guest, ROOM_CLOSED);
@@ -211,7 +235,9 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 	const pinger = setInterval(() => {
 		for (const room of rooms.values()) {
 			room.host.ping();
-			for (const guest of room.guests.values()) guest.ping();
+			for (const guest of room.guests.values()) {
+				guest.ping();
+			}
 		}
 	}, PING_INTERVAL_MS);
 
@@ -240,10 +266,12 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 	};
 }
 
-/** Exact-match routing, so there is no traversal surface; unknown paths get the SPA shell. */
+/** Exact-match routing, so there is no traversal surface. Unknown paths get the SPA shell. */
 function serveStatic(pathname: string): Response {
 	const file = EMBEDDED_FILES[pathname] ?? INDEX_HTML;
-	if (!file) return new Response("not found", { status: 404 });
+	if (!file) {
+		return new Response("not found", { status: 404 });
+	}
 	return new Response(Bun.file(file));
 }
 
@@ -270,7 +298,9 @@ async function startNgrok(
 		traffic_policy: JSON.stringify(policy),
 	});
 	const publicUrl = listener.url();
-	if (!publicUrl) throw new Error("ngrok returned no url");
+	if (!publicUrl) {
+		throw new Error("ngrok returned no url");
+	}
 
 	console.log(`ngrok endpoint: ${publicUrl}`);
 	console.log(`  browser guests:  ${publicUrl}  (sign in with ${provider})`);
@@ -285,15 +315,20 @@ async function startNgrok(
  * drop the error.
  */
 export function redactToken(message: string, token: string): string {
-	if (token.length === 0) return message;
+	if (token.length === 0) {
+		return message;
+	}
+
 	return message.split(token).join("***");
 }
 
-/** `null` for anything that is not a whole number in `0..max`; the caller decides how loudly to die. */
+/** `null` for anything that is not a whole number in `0..max`. */
 export function parseBoundedInt(raw: string, max: number): number | null {
 	// Digits only (no trimming), so "-1", "1.5", "1e3", "", " 8080 " and "zzz" are
 	// all rejected rather than silently becoming a negative, truncation, NaN, or valid.
-	if (!/^\d+$/.test(raw)) return null;
+	if (!/^\d+$/.test(raw)) {
+		return null;
+	}
 	const n = Number(raw);
 	return Number.isSafeInteger(n) && n <= max ? n : null;
 }
@@ -335,11 +370,6 @@ interface Flags {
 	help: boolean;
 }
 
-/**
- * `parseArgs` throws on a malformed flag, and an uncaught throw here dumps a
- * stack trace through the minified bundle. `--port -1` is the common way in: it
- * reads as a missing argument followed by an unknown short option.
- */
 function parseFlags(): Flags {
 	try {
 		return parseArgs({
@@ -373,10 +403,7 @@ if (import.meta.main) {
 		console.log(VERSION);
 		process.exit(0);
 	}
-	// `Number("zzz")` is NaN, which Bun.serve reads as "pick any port" and the
-	// guest cap reads as "no cap" — both silent, and both leave the operator's
-	// relayUrl and firewall rules pointing at nothing. Checked before anything
-	// binds, like the token and the allowlist below.
+
 	const port = parseBoundedInt(values.port, 65535);
 	if (port === null) {
 		console.error(`--port ${values.port}: expected an integer 0-65535`);
@@ -388,9 +415,6 @@ if (import.meta.main) {
 		process.exit(1);
 	}
 
-	// Resolved before the port is bound, so a missing or unreadable token costs
-	// nothing. The file wins over the environment: passing it is the deliberate
-	// choice, and a stale exported token silently overriding it would be worse.
 	let authtoken = process.env.NGROK_AUTHTOKEN ?? "";
 	const tokenFile = values["authtoken-file"];
 	if (tokenFile !== undefined) {
