@@ -85,10 +85,10 @@ requests to host a new room.
 
 The relay binds two listeners on the local machine:
 
-| listener      | address                                       | accepts                            |
-| ------------- | --------------------------------------------- | ---------------------------------- |
-| hosting bind  | `--hostname:--port`, default `127.0.0.1:7466` | everything                         |
-| tunnel origin | ephemeral loopback, not configurable          | everything except host connections |
+| listener     | address                                            | accepts                            |
+| ------------ | -------------------------------------------------- | ---------------------------------- |
+| hosting bind | `--hostname:--port`, default `127.0.0.1:7466`      | everything                         |
+| edge bind    | `--edge-hostname:--edge-port`, default loopback:0  | everything except host connections |
 
 So **`--hostname` is the hosting ACL.** The default keeps hosting to the relay's own machine.
 Widening it deliberately widens hosting, which is how you host from outside a container:
@@ -125,6 +125,9 @@ those used by the relay.
 --hostname <host>     address of the hosting bind (default 127.0.0.1); whoever can
                       reach it can host, so 0.0.0.0 opens hosting to that network
 --max-guests <n>      per-room guest cap, 0 = unlimited (default 0)
+--edge-port <n>       port of the guest-only edge bind (default 0, ephemeral)
+--edge-hostname <h>   address of the edge bind (default 127.0.0.1); widen it to put
+                      your own proxy, or a LAN, in front of guests
 --ngrok-url <url>     reserved ngrok URL, e.g. https://collab.example.com
 --oauth-allow <who>   permitted google identity, repeatable or comma-separated:
                       user@example.com for one address, @example.com for a domain

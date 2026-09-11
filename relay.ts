@@ -19,7 +19,7 @@
  * Payloads are AES-256-GCM sealed by the clients. The relay never holds a
  * key and never inspects anything past the 4-byte routing prefix.
  *
- * Two loopback-or-narrower listeners share one room map: the hosting bind, which
+ * Two listeners, loopback by default, share one room map: the hosting bind, which
  * is the only place a `role=host` upgrade is accepted, and the edge bind, which
  * refuses hosting and is what the ngrok tunnel forwards to. The process always
  * publishes itself through an ngrok endpoint, so an ngrok authtoken is required.
@@ -65,8 +65,10 @@ export interface RelayOptions {
 	/** Address of the hosting bind. Whoever can reach it can host. */
 	hostname?: string;
 	maxGuests?: number;
-	/** Loopback port the tunnel forwards to; 0 picks one. Hosting is refused there. */
+	/** Port the edge bind listens on, 0 for ephemeral. Hosting is refused there. */
 	edgePort?: number;
+	/** Address of the edge bind. Loopback keeps it reachable only by this process's tunnel. */
+	edgeHostname?: string;
 }
 
 export interface RelayHandle {
@@ -115,8 +117,10 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 			if (role !== "host" && role !== "guest") {
 				return new Response("not found", { status: 404 });
 			}
+			// Mirrors the edge's own host rule, so a host attempt gets the same answer
+			// whether the policy caught it or it arrived here through a proxy.
 			if (role === "host" && !hosting) {
-				return new Response("hosting is not available through the tunnel", { status: 403 });
+				return new Response("hosting is not available here", { status: 403 });
 			}
 			const data: SocketData = { roomId: match[1]!, role, peerId: 0 };
 			if (srv.upgrade(req, { data })) {
@@ -224,10 +228,11 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 		fetch: (req, srv) => route(req, srv, true),
 		websocket,
 	});
-	// Always loopback: the tunnel's agent runs in this process and dials it locally.
+	// Loopback by default: the tunnel's agent runs in this process and dials it
+	// locally. Widening it exposes guests to that network without the edge's policy.
 	const guestSocket = Bun.serve<SocketData>({
 		port: opts.edgePort ?? 0,
-		hostname: "127.0.0.1",
+		hostname: opts.edgeHostname ?? "127.0.0.1",
 		fetch: (req, srv) => route(req, srv, false),
 		websocket,
 	});
@@ -248,7 +253,7 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 		// and the printed url is one the operator can paste.
 		hostUrl: `ws://${hostSocket.url.host}`,
 		hostPort: hostPort,
-		guestUrl: `ws://${guestSocket.hostname}:${guestPort}`,
+		guestUrl: `ws://${guestSocket.url.host}`,
 		guestPort: guestPort,
 		stop(): void {
 			clearInterval(pinger);
@@ -276,13 +281,17 @@ function serveStatic(pathname: string): Response {
 }
 
 /**
+ * The tunnel's agent runs in this process and dials the edge bind directly, so a
+ * wildcard bind — which has no address to dial — becomes loopback, which it contains.
+ */
+export function edgeDialAddress(guestUrl: string): string {
+	const { hostname, port } = new URL(guestUrl);
+	return `${hostname === "0.0.0.0" || hostname === "[::]" ? "127.0.0.1" : hostname}:${port}`;
+}
+
+/**
  * The endpoint is the point of this process, so a failure here is fatal rather
  * than degraded: a relay nobody can reach is not a working relay.
- *
- * Takes the handle rather than a port on purpose. Forwarding the tunnel to
- * `relay.hostPort` instead of `relay.guestPort` would hand remote clients the
- * listener that accepts `role=host`, silently undoing the same-host rule, so
- * the choice lives here instead of at the call site.
  */
 async function startNgrok(
 	relay: RelayHandle,
@@ -291,7 +300,7 @@ async function startNgrok(
 	authtoken: string,
 ): Promise<void> {
 	const listener = await forward({
-		addr: `127.0.0.1:${relay.guestPort}`,
+		addr: edgeDialAddress(relay.guestUrl),
 		authtoken,
 		domain: url ? new URL(url).hostname : undefined,
 		traffic_policy: JSON.stringify(policy),
@@ -335,6 +344,9 @@ const HELP = `omp-ngrok-relay ${VERSION} — content-blind relay for omp collab 
   --hostname <host>     address of the hosting bind (default 127.0.0.1); whoever can
                         reach it can host, so 0.0.0.0 opens hosting to that network
   --max-guests <n>      per-room guest cap, 0 = unlimited (default 0)
+  --edge-port <n>       port of the guest-only edge bind (default 0, ephemeral)
+  --edge-hostname <h>   address of the edge bind (default 127.0.0.1); widen it to put
+                        your own proxy, or a LAN, in front of guests
   --ngrok-url <url>     reserved ngrok URL, e.g. https://collab.example.com
   --oauth-allow <who>   permitted google identity, repeatable or comma-separated:
                         user@example.com for one address, @example.com for a domain
@@ -357,6 +369,8 @@ interface Flags {
 	port: string;
 	hostname: string;
 	"max-guests": string;
+	"edge-port": string;
+	"edge-hostname": string;
 	"ngrok-url"?: string;
 	"oauth-allow": string[];
 	"authtoken-file"?: string;
@@ -372,6 +386,8 @@ function parseFlags(): Flags {
 				port: { type: "string", default: "7466" },
 				hostname: { type: "string", default: "127.0.0.1" },
 				"max-guests": { type: "string", default: "0" },
+				"edge-port": { type: "string", default: "0" },
+				"edge-hostname": { type: "string", default: "127.0.0.1" },
 				"ngrok-url": { type: "string" },
 				"oauth-allow": { type: "string", multiple: true, default: [] },
 				"authtoken-file": { type: "string" },
@@ -400,6 +416,11 @@ if (import.meta.main) {
 	const port = parseBoundedInt(values.port, 65535);
 	if (port === null) {
 		console.error(`--port ${values.port}: expected an integer 0-65535`);
+		process.exit(1);
+	}
+	const edgePort = parseBoundedInt(values["edge-port"], 65535);
+	if (edgePort === null) {
+		console.error(`--edge-port ${values["edge-port"]}: expected an integer 0-65535`);
 		process.exit(1);
 	}
 	const maxGuests = parseBoundedInt(values["max-guests"], Number.MAX_SAFE_INTEGER);
@@ -447,7 +468,13 @@ if (import.meta.main) {
 		process.exit(1);
 	}
 
-	const relay = startRelay({ port, hostname: values.hostname, maxGuests });
+	const relay = startRelay({
+		port,
+		hostname: values.hostname,
+		maxGuests,
+		edgePort,
+		edgeHostname: values["edge-hostname"],
+	});
 	console.log(`omp-ngrok-relay ${VERSION} listening on ${relay.hostUrl}`);
 	console.log(`  hosting bind:  ${relay.hostUrl}`);
 	console.log(`     omp config set collab.relayUrl ${relay.hostUrl}`);

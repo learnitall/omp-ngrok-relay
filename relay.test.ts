@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { networkInterfaces } from "node:os";
 import { ENVELOPE_HEADER_LENGTH } from "@oh-my-pi/pi-wire";
-import { parseBoundedInt, type RelayHandle, redactToken, startRelay } from "./relay";
+import { edgeDialAddress, parseBoundedInt, type RelayHandle, redactToken, startRelay } from "./relay";
 
 const ROOM = "TESTROOMabcdef";
 let relay: RelayHandle;
@@ -238,4 +238,15 @@ test("parseBoundedInt rejects invalid or out-of-bounds values", () => {
 	expect(parseBoundedInt("", 65535)).toBe(null);
 	expect(parseBoundedInt(" 8080", 65535)).toBe(null);
 	expect(parseBoundedInt("8080 ", 65535)).toBe(null);
+});
+
+// A wildcard bind is not an address the tunnel's agent can dial, and ngrok fails
+// the forward rather than guessing; a specific bind must be dialled as given, or
+// the tunnel reaches a listener the operator did not publish.
+test("edgeDialAddress dials the edge bind, resolving wildcards to loopback", () => {
+	expect(edgeDialAddress("ws://0.0.0.0:7467")).toBe("127.0.0.1:7467");
+	expect(edgeDialAddress("ws://[::]:7467")).toBe("127.0.0.1:7467");
+	expect(edgeDialAddress("ws://127.0.0.1:59663")).toBe("127.0.0.1:59663");
+	expect(edgeDialAddress("ws://192.168.1.10:7467")).toBe("192.168.1.10:7467");
+	expect(edgeDialAddress("ws://[::1]:7467")).toBe("[::1]:7467");
 });
