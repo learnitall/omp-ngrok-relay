@@ -143,6 +143,16 @@ try {
 	const unknown = await fetch(`${publicUrl}/wp-login.php`, { redirect: "manual" });
 	check("an unlisted path is 404, not a redirect", unknown.status === 404, `got ${unknown.status}`);
 
+	// Undocumented and edge-served, so the only way to know they are still in the
+	// allowlist is to ask. A 404 in here does not fail closed, it stalls the
+	// visitor mid-flow: the error landing is where a declined consent screen goes,
+	// and 404ing it hides ngrok's own "try again" page. Anything but 404 means the
+	// request reached the oauth action rather than the deny rule.
+	for (const landing of ["/ngrok/callback/error?state=e2e", "/ngrok/callback/authn?state=e2e"]) {
+		const res = await fetch(`${publicUrl}${landing}`, { redirect: "manual" });
+		check(`${landing.split("?")[0]} is not 404ed by the path allowlist`, res.status !== 404, `got ${res.status}`);
+	}
+
 	// The SPA shell is behind oauth, so an anonymous GET starts the flow.
 	const shell = await fetch(`${publicUrl}/`, { redirect: "manual" });
 	const location = shell.headers.get("location") ?? "";
@@ -186,6 +196,7 @@ try {
 	// verbatim.
 	const variants = [
 		[`/ngrok/../r/${ROOM}?role=host`, "dot-segment through the allowlisted /ngrok/ prefix"],
+		[`/ngrok/callback/../../r/${ROOM}?role=host`, "two-level dot-segment out of /ngrok/callback/"],
 		[`/./r/${ROOM}?role=host`, "single dot segment"],
 		[`/%2e%2e/r/${ROOM}?role=host`, "percent-encoded dot segments"],
 		[`/r/x/../${ROOM}?role=host`, "dot-segment inside /r/"],

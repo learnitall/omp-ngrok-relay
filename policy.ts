@@ -23,15 +23,6 @@
  * authenticated browser guests instead of anonymous terminal ones.
  */
 
-/**
- * ngrok's `oauth` action reserves exactly two endpoint-local paths, `/ngrok/login`
- * and `/ngrok/logout`. Matched exactly rather than by `/ngrok/` prefix, which also
- * admitted `/ngrok/../r/<room>?role=host` — a path the relay resolves to a genuine
- * host upgrade. `req.url.path` excludes the query string, so the documented
- * `?auth_id=` and `?redirect_path=` forms still match.
- */
-const NGROK_AUTH_PATHS = "req.url.path == '/ngrok/login' || req.url.path == '/ngrok/logout'";
-
 /** The liveness probe is the one thing the edge serves unauthenticated. */
 const NOT_HEALTHZ = "req.url.path != '/healthz'";
 
@@ -105,16 +96,16 @@ export function buildTrafficPolicy(oauth: OAuthConfig): object {
 					},
 				],
 			},
-			// Ahead of the OAuth rule, so a scan for unrelated paths gets a flat 404
-			// instead of a redirect that advertises the identity provider.
 			{
 				name: "allow only the relay, health, the static client, and ngrok's auth paths",
 				expressions: [
-					"!(req.url.path == '/' || req.url.path == '/healthz' || req.url.path.startsWith('/r/') " +
-						"|| (" +
-						NGROK_AUTH_PATHS +
-						") " +
-						"|| req.url.path.matches('^/[A-Za-z0-9_.-]+[.](css|js|map|png|svg|ico|webmanifest|txt|xml|woff2?)$'))",
+					"!(" +
+						"req.url.path == '/' || " +
+						"req.url.path == '/healthz' || " +
+						"req.url.path.startsWith('/r/') || " +
+						"req.url.path.startsWith('/ngrok/') || " +
+						"req.url.path.matches('^/[A-Za-z0-9_.-]+[.](css|js|map|png|svg|ico|webmanifest|txt|xml|woff2?)$')" +
+						")",
 				],
 				actions: [{ type: "deny", config: { status_code: 404 } }],
 			},
