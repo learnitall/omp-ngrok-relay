@@ -280,20 +280,12 @@ async function startNgrok(
 
 /**
  * ngrok's ERR_NGROK_105 quotes the supplied authtoken back verbatim, so printing
- * its message writes the account credential to the log — once per restart under
- * the systemd recipe. The operator still needs the rest of the message to tell a
- * bad token from a bad domain, so redact the value rather than drop the error.
- * Matched on the token itself, never on ngrok's phrasing: a future message could
- * carry it in different words.
+ * its message writes the account credential to the log. We still need the rest of
+ * the message to tell a bad token from a bad domain, so redact the value rather than
+ * drop the error.
  */
 export function redactToken(message: string, token: string): string {
 	if (token.length === 0) return message;
-	// A short token would blank out unrelated words wherever it coincidentally
-	// appeared, and an unreadable message is worse than none. A real ngrok token
-	// is ~49 characters, so this only fires on a degenerate one.
-	if (token.length < 8) {
-		return message.includes(token) ? "<redacted: the message contained the authtoken>" : message;
-	}
 	return message.split(token).join("***");
 }
 
