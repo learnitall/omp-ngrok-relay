@@ -38,9 +38,6 @@ omp-ngrok-relay 0.1.0 listening on ws://127.0.0.1:7466
      or one-shot, no config:  /collab ws://127.0.0.1:7466
   edge bind (guests only):  ws://127.0.0.1:59663
 ngrok endpoint: https://<temp>.ngrok-free.app
-  browser guests:  https://<temp>.ngrok-free.app  (sign in with google)
-  hosting through the tunnel is refused; hosts use the hosting bind.
-  terminal guests (`omp join`) cannot authenticate and will be rejected.
 ```
 
 - omp host command: `/collab ws://127.0.0.1:7466`
@@ -129,8 +126,7 @@ those used by the relay.
                       reach it can host, so 0.0.0.0 opens hosting to that network
 --max-guests <n>      per-room guest cap, 0 = unlimited (default 0)
 --ngrok-url <url>     reserved ngrok URL, e.g. https://collab.example.com
---oauth-provider <p>  ngrok OAuth provider for browser guests (default google)
---oauth-allow <who>   permitted identity, repeatable or comma-separated:
+--oauth-allow <who>   permitted google identity, repeatable or comma-separated:
                       user@example.com for one address, @example.com for a domain
 --authtoken-file <p>  file holding the ngrok authtoken; wins over NGROK_AUTHTOKEN
 --version, --help
@@ -139,8 +135,8 @@ those used by the relay.
 An ngrok authtoken is required, from `NGROK_AUTHTOKEN` or `--authtoken-file`. At least one `--oauth-allow` is
 required too. Token, allowlist and policy are all resolved before
 
-The `@` on a domain passed to `--oauth-allow` can be used to allow any user from the domain:
-`@example.com` compiles to `endsWith('@example.com')`
+OAuth is always Google. The `@` on a domain passed to `--oauth-allow` can be used to allow any user
+from the domain: `@example.com` compiles to `endsWith('@example.com')`.
 
 ## Credits
 

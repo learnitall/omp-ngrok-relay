@@ -288,7 +288,6 @@ async function startNgrok(
 	relay: RelayHandle,
 	url: string | undefined,
 	policy: object,
-	provider: string,
 	authtoken: string,
 ): Promise<void> {
 	const listener = await forward({
@@ -303,9 +302,6 @@ async function startNgrok(
 	}
 
 	console.log(`ngrok endpoint: ${publicUrl}`);
-	console.log(`  browser guests:  ${publicUrl}  (sign in with ${provider})`);
-	console.log("  hosting through the tunnel is refused; hosts use the hosting bind.");
-	console.log("  terminal guests (`omp join`) cannot authenticate and will be rejected.");
 }
 
 /**
@@ -340,8 +336,7 @@ const HELP = `omp-ngrok-relay ${VERSION} — content-blind relay for omp collab 
                         reach it can host, so 0.0.0.0 opens hosting to that network
   --max-guests <n>      per-room guest cap, 0 = unlimited (default 0)
   --ngrok-url <url>     reserved ngrok URL, e.g. https://collab.example.com
-  --oauth-provider <p>  ngrok OAuth provider for browser guests (default google)
-  --oauth-allow <who>   permitted identity, repeatable or comma-separated:
+  --oauth-allow <who>   permitted google identity, repeatable or comma-separated:
                         user@example.com for one address, @example.com for a domain
   --authtoken-file <p>  file holding the ngrok authtoken; wins over NGROK_AUTHTOKEN
   --version, --help
@@ -363,7 +358,6 @@ interface Flags {
 	hostname: string;
 	"max-guests": string;
 	"ngrok-url"?: string;
-	"oauth-provider": string;
 	"oauth-allow": string[];
 	"authtoken-file"?: string;
 	version: boolean;
@@ -379,7 +373,6 @@ function parseFlags(): Flags {
 				hostname: { type: "string", default: "127.0.0.1" },
 				"max-guests": { type: "string", default: "0" },
 				"ngrok-url": { type: "string" },
-				"oauth-provider": { type: "string", default: "google" },
 				"oauth-allow": { type: "string", multiple: true, default: [] },
 				"authtoken-file": { type: "string" },
 				version: { type: "boolean", default: false },
@@ -439,18 +432,16 @@ if (import.meta.main) {
 
 	// Built before the port is bound, so a malformed allowlist costs nothing. The
 	// policy is the endpoint's only access control, so an invalid one is fatal.
-	const provider = values["oauth-provider"];
+	// Trimmed because the help text advertises "comma-separated", and the natural
+	// spelling of that has a space after the comma.
+	const allow = values["oauth-allow"]
+		.flatMap((v) => v.split(","))
+		.map((v) => v.trim())
+		.filter((v) => v.length > 0);
+
 	let policy: object;
 	try {
-		policy = buildTrafficPolicy({
-			provider,
-			// Trimmed because the help text advertises "comma-separated", and the
-			// natural spelling of that has a space after the comma.
-			allow: values["oauth-allow"]
-				.flatMap((v) => v.split(","))
-				.map((v) => v.trim())
-				.filter((v) => v.length > 0),
-		});
+		policy = buildTrafficPolicy(allow);
 	} catch (err) {
 		console.error(err instanceof Error ? err.message : String(err));
 		process.exit(1);
@@ -464,7 +455,7 @@ if (import.meta.main) {
 	console.log(`  edge bind (guests only):  ${relay.guestUrl}`);
 
 	try {
-		await startNgrok(relay, values["ngrok-url"], policy, provider, authtoken);
+		await startNgrok(relay, values["ngrok-url"], policy, authtoken);
 	} catch (err) {
 		console.error(`ngrok: ${redactToken(err instanceof Error ? err.message : String(err), authtoken)}`);
 		relay.stop();

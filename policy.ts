@@ -31,14 +31,9 @@ const NOT_HEALTHZ = "req.url.path != '/healthz'";
  */
 const ALLOW_EMAIL = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 const ALLOW_DOMAIN = /^@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
-const PROVIDER = /^[a-z0-9-]{1,32}$/;
 
-export interface OAuthConfig {
-	/** ngrok provider id; without a client id only providers with a managed app work. */
-	provider: string;
-	/** `user@example.com` for one address, `@example.com` for a whole domain; matched case-insensitively. */
-	allow: string[];
-}
+/** ngrok provider id. Fixed: the relay configures Google and nothing else. */
+const PROVIDER = "google";
 
 /**
  * Operator data reaching a CEL expression is validated, not escaped: an entry
@@ -72,12 +67,9 @@ function identityTest(allow: string[]): string {
 	return tests.join(" || ");
 }
 
-export function buildTrafficPolicy(oauth: OAuthConfig): object {
-	if (!PROVIDER.test(oauth.provider)) {
-		throw new Error(`--oauth-provider ${oauth.provider}: expected an ngrok provider id such as google or github`);
-	}
-	if (oauth.allow.length === 0) throw new Error("--oauth-allow is required: OAuth with no allowlist admits everyone");
-	const allowed = identityTest(oauth.allow);
+export function buildTrafficPolicy(allow: string[]): object {
+	if (allow.length === 0) throw new Error("--oauth-allow is required: OAuth with no allowlist admits everyone");
+	const allowed = identityTest(allow);
 
 	return {
 		on_http_request: [
@@ -122,7 +114,7 @@ export function buildTrafficPolicy(oauth: OAuthConfig): object {
 			{
 				name: "require oauth on everything the browser touches",
 				expressions: [NOT_HEALTHZ],
-				actions: [{ type: "oauth", config: { provider: oauth.provider } }],
+				actions: [{ type: "oauth", config: { provider: PROVIDER } }],
 			},
 			// OAuth only proves the visitor has an account with the provider; without
 			// this rule "authenticated" means "has a Google account", which is not

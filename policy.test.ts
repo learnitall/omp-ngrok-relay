@@ -12,8 +12,8 @@ interface Rule {
 	actions: Action[];
 }
 
-function rules(allow: string[], provider = "google"): Rule[] {
-	const policy = buildTrafficPolicy({ provider, allow }) as { on_http_request: Rule[] };
+function rules(allow: string[]): Rule[] {
+	const policy = buildTrafficPolicy(allow) as { on_http_request: Rule[] };
 	return policy.on_http_request;
 }
 
@@ -110,15 +110,6 @@ test.each([
 	"a\u007fb@example.com",
 ])("rejects %p", (entry) => {
 	expect(() => rules([entry])).toThrow(/--oauth-allow/);
-});
-
-test("rejects a provider that is not a bare identifier", () => {
-	expect(() => rules(["@example.com"], "google'} , {'x")).toThrow(/--oauth-provider/);
-});
-
-test("the provider reaches the oauth action", () => {
-	const policy = buildTrafficPolicy({ provider: "github", allow: ["@example.com"] });
-	expect(JSON.stringify(policy)).toContain('"provider":"github"');
 });
 
 /**
