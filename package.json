@@ -1,6 +1,6 @@
 {
   "name": "omp-ngrok-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Content-blind, self-hostable relay for omp collab sessions, with an embedded browser client, published through ngrok",
   "license": "MIT",
   "type": "module",
