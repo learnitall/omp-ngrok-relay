@@ -18,9 +18,9 @@
  * key and never inspects anything past the 4-byte routing prefix.
  *
  * Two loopback-or-narrower listeners share one room map: the hosting bind, which
- * is the only place a `role=host` upgrade is accepted, and the tunnel's own
- * origin, which refuses hosting. The process always publishes itself through an
- * ngrok endpoint, so an ngrok authtoken is required.
+ * is the only place a `role=host` upgrade is accepted, and the edge bind, which
+ * refuses hosting and is what the ngrok tunnel forwards to. The process always
+ * publishes itself through an ngrok endpoint, so an ngrok authtoken is required.
  */
 import { parseArgs } from "node:util";
 import { forward } from "@ngrok/ngrok";
@@ -70,12 +70,12 @@ export interface RelayOptions {
 }
 
 export interface RelayHandle {
-	/** ws://host:port — the hosting bind; `role=host` is only ever accepted here. */
-	url: string;
-	port: number;
-	/** ws://127.0.0.1:port — the tunnel's origin, guests only. */
-	edgeUrl: string;
-	edgePort: number;
+	/** The hosting bind, `role=host` only. */
+	hostUrl: string;
+	hostPort: number;
+	/** The edge bind, `role=guest` only; the tunnel's origin when one is running. */
+	guestUrl: string;
+	guestPort: number;
 	/** Closes every room and stops both listeners. */
 	stop(): void;
 }
@@ -90,7 +90,7 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 		}
 	};
 
-	const control = (ws: RelaySocket, msg: RelayControlToHost | RelayControlToGuest): void => {
+	const sendControlMessage = (ws: RelaySocket, msg: RelayControlToHost | RelayControlToGuest): void => {
 		send(ws, JSON.stringify(msg));
 	};
 
@@ -149,7 +149,7 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 			const peerId = room.nextPeerId++;
 			ws.data.peerId = peerId;
 			room.guests.set(peerId, ws);
-			control(room.host, { t: "peer-joined", peer: peerId });
+			sendControlMessage(room.host, { t: "peer-joined", peer: peerId });
 			console.log(`room ${roomId}: peer ${peerId} joined`);
 		},
 		message(ws: RelaySocket, message: string | Buffer): void {
@@ -180,7 +180,7 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 				if (room.host !== ws) return;
 				rooms.delete(roomId);
 				for (const guest of room.guests.values()) {
-					control(guest, ROOM_CLOSED);
+					sendControlMessage(guest, ROOM_CLOSED);
 					guest.close(4001, "room closed");
 				}
 				console.log(`room ${roomId} closed (${room.guests.size} guests dropped)`);
@@ -188,20 +188,20 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 				return;
 			}
 			if (room.guests.delete(peerId)) {
-				control(room.host, { t: "peer-left", peer: peerId });
+				sendControlMessage(room.host, { t: "peer-left", peer: peerId });
 				console.log(`room ${roomId}: peer ${peerId} left`);
 			}
 		},
 	};
 
-	const local = Bun.serve<SocketData>({
+	const hostSocket = Bun.serve<SocketData>({
 		port: opts.port ?? 7466,
 		hostname: opts.hostname ?? "127.0.0.1",
 		fetch: (req, srv) => route(req, srv, true),
 		websocket,
 	});
 	// Always loopback: the tunnel's agent runs in this process and dials it locally.
-	const edge = Bun.serve<SocketData>({
+	const guestSocket = Bun.serve<SocketData>({
 		port: opts.edgePort ?? 0,
 		hostname: "127.0.0.1",
 		fetch: (req, srv) => route(req, srv, false),
@@ -215,27 +215,27 @@ export function startRelay(opts: RelayOptions = {}): RelayHandle {
 		}
 	}, PING_INTERVAL_MS);
 
-	const port = local.port ?? 0;
-	const edgePort = edge.port ?? 0;
+	const hostPort = hostSocket.port ?? 0;
+	const guestPort = guestSocket.port ?? 0;
 	return {
 		// Bun canonicalises the bind address, so an IPv6 literal comes out bracketed
 		// and the printed url is one the operator can paste.
-		url: `ws://${local.url.host}`,
-		port,
-		edgeUrl: `ws://${edge.hostname}:${edgePort}`,
-		edgePort,
+		hostUrl: `ws://${hostSocket.url.host}`,
+		hostPort: hostPort,
+		guestUrl: `ws://${guestSocket.hostname}:${guestPort}`,
+		guestPort: guestPort,
 		stop(): void {
 			clearInterval(pinger);
 			for (const room of rooms.values()) {
 				for (const guest of room.guests.values()) {
-					control(guest, ROOM_CLOSED);
+					sendControlMessage(guest, ROOM_CLOSED);
 					guest.close(4001, "room closed");
 				}
 				room.host.close(1001, "relay shutting down");
 			}
 			rooms.clear();
-			local.stop(true);
-			edge.stop(true);
+			hostSocket.stop(true);
+			guestSocket.stop(true);
 		},
 	};
 }
@@ -252,7 +252,7 @@ function serveStatic(pathname: string): Response {
  * than degraded: a relay nobody can reach is not a working relay.
  *
  * Takes the handle rather than a port on purpose. Forwarding the tunnel to
- * `relay.port` instead of `relay.edgePort` would hand remote clients the
+ * `relay.hostPort` instead of `relay.guestPort` would hand remote clients the
  * listener that accepts `role=host`, silently undoing the same-host rule, so
  * the choice lives here instead of at the call site.
  */
@@ -264,7 +264,7 @@ async function startNgrok(
 	authtoken: string,
 ): Promise<void> {
 	const listener = await forward({
-		addr: `127.0.0.1:${relay.edgePort}`,
+		addr: `127.0.0.1:${relay.guestPort}`,
 		authtoken,
 		domain: url ? new URL(url).hostname : undefined,
 		traffic_policy: JSON.stringify(policy),
@@ -433,11 +433,11 @@ if (import.meta.main) {
 	}
 
 	const relay = startRelay({ port, hostname: values.hostname, maxGuests });
-	console.log(`omp-ngrok-relay ${VERSION} listening on ${relay.url}`);
-	console.log(`  hosting bind:  ${relay.url}`);
-	console.log(`     omp config set collab.relayUrl ${relay.url}`);
-	console.log(`     or one-shot, no config:  /collab ${relay.url}`);
-	console.log(`  tunnel origin (guests only):  ${relay.edgeUrl}`);
+	console.log(`omp-ngrok-relay ${VERSION} listening on ${relay.hostUrl}`);
+	console.log(`  hosting bind:  ${relay.hostUrl}`);
+	console.log(`     omp config set collab.relayUrl ${relay.hostUrl}`);
+	console.log(`     or one-shot, no config:  /collab ${relay.hostUrl}`);
+	console.log(`  edge bind (guests only):  ${relay.guestUrl}`);
 
 	try {
 		await startNgrok(relay, values["ngrok-url"], policy, provider, authtoken);

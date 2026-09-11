@@ -19,7 +19,7 @@ interface Peer {
 	next(): Promise<Frame>;
 }
 
-async function dial(role: "host" | "guest", room = ROOM, base = relay.url): Promise<Peer> {
+async function dial(role: "host" | "guest", room = ROOM, base = relay.hostUrl): Promise<Peer> {
 	const ws = new WebSocket(`${base}/r/${room}?role=${role}`);
 	ws.binaryType = "arraybuffer";
 
@@ -102,19 +102,19 @@ test("relays a 4 MiB frame, stamps the sender's peerId, and keeps targeted frame
 });
 
 test("a guest for a room with no host is rejected with 4004", async () => {
-	expect(await closeCode(`${relay.url}/r/NOSUCHROOMxyz?role=guest`)).toBe(4004);
+	expect(await closeCode(`${relay.hostUrl}/r/NOSUCHROOMxyz?role=guest`)).toBe(4004);
 });
 
 test("a second host for a live room is rejected with 4009", async () => {
 	const host = await dial("host", "SECONDHOSTroom");
-	expect(await closeCode(`${relay.url}/r/SECONDHOSTroom?role=host`)).toBe(4009);
+	expect(await closeCode(`${relay.hostUrl}/r/SECONDHOSTroom?role=host`)).toBe(4009);
 	host.ws.close();
 });
 
 // The CLI cannot be smoke-tested without an ngrok token, so the HTTP surface
 // is covered here, against the library.
 test("serves /healthz", async () => {
-	const res = await fetch(`http://127.0.0.1:${relay.port}/healthz`);
+	const res = await fetch(`http://127.0.0.1:${relay.hostPort}/healthz`);
 	expect(res.status).toBe(200);
 	expect(await res.text()).toBe("ok");
 });
@@ -123,7 +123,7 @@ test("serves /healthz", async () => {
 // must render the client shell, not a 404. Holds either way when no client is
 // embedded, which is what a bare `bun test` sees.
 test("unknown paths mirror the client shell", async () => {
-	const base = `http://127.0.0.1:${relay.port}`;
+	const base = `http://127.0.0.1:${relay.hostPort}`;
 	const [root, deep] = await Promise.all([fetch(`${base}/`), fetch(`${base}/some/deep/link`)]);
 	expect(deep.status).toBe(root.status);
 	expect(await deep.text()).toBe(await root.text());
@@ -134,19 +134,19 @@ test("unknown paths mirror the client shell", async () => {
 // local one are indistinguishable by source address.
 test("the tunnel's listener refuses role=host but the hosting bind accepts it", async () => {
 	const path = "/r/EDGEHOSTroomx?role=host";
-	const edge = await fetch(`http://127.0.0.1:${relay.edgePort}${path}`);
+	const edge = await fetch(`http://127.0.0.1:${relay.guestPort}${path}`);
 	expect(edge.status).toBe(403);
 
 	// 426, not 403: the same request on the hosting bind gets as far as the
 	// upgrade, so the 403 above is the host check and not a routing accident.
-	const local = await fetch(`http://127.0.0.1:${relay.port}${path}`);
+	const local = await fetch(`http://127.0.0.1:${relay.hostPort}${path}`);
 	expect(local.status).toBe(426);
 });
 
 test("a browser guest through the tunnel joins a room on the hosting bind", async () => {
 	const room = "EDGEGUESTroom";
 	const host = await dial("host", room);
-	const guest = await dial("guest", room, relay.edgeUrl);
+	const guest = await dial("guest", room, relay.guestUrl);
 	expect(await host.next()).toBe('{"t":"peer-joined","peer":1}');
 
 	// Both listeners share one room map, or the frame never arrives.
@@ -161,7 +161,7 @@ test("a browser guest through the tunnel joins a room on the hosting bind", asyn
 // Browser guests arrive through the tunnel, so its listener must serve the
 // client shell and the probe the traffic policy leaves unauthenticated.
 test("the tunnel's listener still serves the client and /healthz", async () => {
-	const base = `http://127.0.0.1:${relay.edgePort}`;
+	const base = `http://127.0.0.1:${relay.guestPort}`;
 	const [health, shell] = await Promise.all([fetch(`${base}/healthz`), fetch(`${base}/some/deep/link`)]);
 	expect(await health.text()).toBe("ok");
 	expect(shell.status).toBe(200);
@@ -178,10 +178,10 @@ test.skipIf(!lan)("a wide bind lets a remote peer host, but never through the tu
 	const wide = startRelay({ port: 0, hostname: "0.0.0.0" });
 	try {
 		const path = "/r/WIDEBINDroomx?role=host";
-		const remote = await fetch(`http://${lan}:${wide.port}${path}`);
+		const remote = await fetch(`http://${lan}:${wide.hostPort}${path}`);
 		expect(remote.status).toBe(426);
 
-		const tunnel = await fetch(`http://127.0.0.1:${wide.edgePort}${path}`);
+		const tunnel = await fetch(`http://127.0.0.1:${wide.guestPort}${path}`);
 		expect(tunnel.status).toBe(403);
 	} finally {
 		wide.stop();
@@ -194,7 +194,7 @@ test.skipIf(!lan)("a wide bind lets a remote peer host, but never through the tu
 test.skipIf(!lan)("a wide bind serves guests without oauth, since oauth lives at the edge", async () => {
 	const wide = startRelay({ port: 0, hostname: "0.0.0.0" });
 	try {
-		const res = await fetch(`http://${lan}:${wide.port}/r/WIDEGUESTroom?role=guest`);
+		const res = await fetch(`http://${lan}:${wide.hostPort}/r/WIDEGUESTroom?role=guest`);
 		expect(res.status).toBe(426);
 	} finally {
 		wide.stop();

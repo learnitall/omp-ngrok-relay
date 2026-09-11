@@ -36,7 +36,7 @@ omp-ngrok-relay 0.1.0 listening on ws://127.0.0.1:7466
   hosting bind:  ws://127.0.0.1:7466
      omp config set collab.relayUrl ws://127.0.0.1:7466
      or one-shot, no config:  /collab ws://127.0.0.1:7466
-  tunnel origin (guests only):  ws://127.0.0.1:59663
+  edge bind (guests only):  ws://127.0.0.1:59663
 ngrok endpoint: https://<temp>.ngrok-free.app
   browser guests:  https://<temp>.ngrok-free.app  (sign in with google)
   hosting through the tunnel is refused; hosts use the hosting bind.
