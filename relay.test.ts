@@ -89,6 +89,11 @@ test("relays a 4 MiB frame, stamps the sender's peerId, and keeps targeted frame
 	expect(((await guest2.next()) as Uint8Array).byteLength).toBe(targeted.byteLength);
 	expect(((await guest1.next()) as Uint8Array).byteLength).toBe(broadcast.byteLength);
 
+	// A guest leaving is the other half of the peer lifecycle: the host routes by
+	// peerId, so it has to be told the id is gone.
+	guest2.ws.close();
+	expect(await host.next()).toBe('{"t":"peer-left","peer":2}');
+
 	// Host gone: guests are told, then closed with 4001.
 	host.ws.close();
 	expect(await guest1.next()).toBe('{"t":"room-closed"}');
