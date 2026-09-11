@@ -9,8 +9,8 @@ with others.
 
 Start the relay, launch a new omp agent session, and paste in the `/collab` link from the relay's
 logs. Save the room token from the `/collab` output and give it to others, along with the URL
-to the ngrok endpoint in front of the relay. They'll be able to join your omp session from their
-browser.
+they reach the relay on — the ngrok endpoint, if you published one. They'll be able to join your
+omp session from their browser.
 
 omp ships with a public relay at `wss://my.omp.sh`. This project is the same thing, it's just run
 by you on your own machine, and optionally published and protected with ngrok.
@@ -18,9 +18,9 @@ by you on your own machine, and optionally published and protected with ngrok.
 ## Quick start
 
 ```sh
-nix build .#relay
+nix build .#relay               # binary lands in ./result/bin
 export NGROK_AUTHTOKEN=...      # or --authtoken-file
-./bin/omp-ngrok-relay --oauth-allow you@gmail.com
+./result/bin/omp-ngrok-relay --oauth-allow you@gmail.com
 ```
 
 Or without cloning anything:
@@ -34,7 +34,7 @@ it however the two binds are reachable — over a LAN, or through a proxy you pu
 `--edge-hostname` yourself:
 
 ```sh
-./bin/omp-ngrok-relay --edge-hostname 0.0.0.0 --edge-port 7478
+./result/bin/omp-ngrok-relay --edge-hostname 0.0.0.0 --edge-port 7478
 ```
 
 Either way it prints both doors:
@@ -97,7 +97,7 @@ https://<endpoint url>/#wss://<endpoint url>/r/<token>
 **Opening a room is gated by reachability**. Use CLI args to control where the relay listens for
 requests to host a new room.
 
-The relay binds two listeners on the local machine:
+The relay binds two listeners, both loopback by default:
 
 | listener     | address                                            | accepts                            |
 | ------------ | -------------------------------------------------- | ---------------------------------- |
@@ -123,8 +123,8 @@ dropped: the endpoint is anonymous, and anyone with the URL and a room token can
 
 The upstream browser client from [`packages/collab-web`](https://github.com/can1357/oh-my-pi/tree/main/packages/collab-web)
 is packaged into the relay for guests to use when they connect. It's a set of static assets that are
-served by the relay through the ngrok endpoint. The relay takes care of hooking guests into the
-host agent's session.
+served by the relay itself, on whichever bind the guest reaches. The relay takes care of hooking
+guests into the host agent's session.
 
 OAuth costs you terminal guests: `omp join` isn't compatible with it, so an allowlist buys
 authenticated browser guests at the price of anonymous terminal ones. Drop the allowlist and
@@ -132,7 +132,8 @@ authenticated browser guests at the price of anonymous terminal ones. Drop the a
 
 An open relay also risks plain abuse, since anyone who learns the hostname can open rooms and push
 bytes through it, so the ngrok traffic policy caps handshakes per client IP and 404s any path outside
-those used by the relay. Those two rules apply whether or not OAuth is configured.
+those used by the relay. Those two rules apply whether or not OAuth is configured — but they live at
+the ngrok edge, so a local-only relay has neither. Keep its binds narrow.
 
 ## Options
 
