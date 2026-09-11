@@ -297,42 +297,6 @@ export function redactToken(message: string, token: string): string {
 	return message.split(token).join("***");
 }
 
-/** How far the hosting bind reaches; see `bindScope`. */
-export type BindScope = "loopback" | "any" | "specific";
-
-/**
- * `--hostname` is the hosting ACL, so the startup log has to be honest about how
- * wide it is — and that is a property of the address, not of its spelling: `0`,
- * `0x0`, `::0` and `2130706433` all bind something a literal comparison misses.
- * WHATWG's host parser canonicalises every one of them, so classify the parsed
- * host instead.
- *
- * Anything unrecognised is `specific` rather than `loopback`, which also catches
- * a LAN-only bind: over-warning about a narrow bind is cheap, staying quiet
- * about a wide one is not.
- */
-export function bindScope(hostname: string): BindScope {
-	const literal = hostname.includes(":") && !hostname.startsWith("[") ? `[${hostname}]` : hostname;
-	let host: string;
-	try {
-		host = new URL(`http://${literal}`).hostname;
-	} catch {
-		return "specific";
-	}
-	if (host === "0.0.0.0" || host === "[::]") return "any";
-	// Canonical IPv4 is always a dotted quad, so the prefix is the whole of 127/8.
-	// IPv4-mapped IPv6 loopback like ::ffff:127.0.0.1 normalises to [::ffff:7f00:1].
-	if (
-		host === "localhost" ||
-		host === "[::1]" ||
-		host.startsWith("127.") ||
-		(host.startsWith("[::ffff:7f") && host.endsWith(":1]"))
-	) {
-		return "loopback";
-	}
-	return "specific";
-}
-
 /** `null` for anything that is not a whole number in `0..max`; the caller decides how loudly to die. */
 export function parseBoundedInt(raw: string, max: number): number | null {
 	// Digits only (no trimming), so "-1", "1.5", "1e3", "", " 8080 " and "zzz" are
@@ -477,27 +441,10 @@ if (import.meta.main) {
 	}
 
 	const relay = startRelay({ port, hostname: values.hostname, maxGuests });
-	const embedded = Object.keys(EMBEDDED_FILES).length;
-	console.log(
-		`omp-ngrok-relay ${VERSION} listening on ${relay.url}` +
-			(embedded > 0 ? ` (${embedded} embedded client files)` : " (no embedded web client)"),
-	);
-	// `--hostname` is the hosting ACL, so a bind wider than loopback is worth
-	// saying out loud. The unspecified address has no address to hand out either:
-	// the host reaches it on whatever routes there, which for a published
-	// container port is the loopback of the machine outside it.
-	const scope = bindScope(values.hostname);
-	const reach =
-		scope === "any"
-			? "  (reachable on every address of this host)"
-			: scope === "specific"
-				? "  (not loopback: whoever can route to it can host)"
-				: "";
-	console.log(`  hosting bind:  ${relay.url}${reach}`);
-	if (scope !== "any") {
-		console.log(`     omp config set collab.relayUrl ${relay.url}`);
-		console.log(`     or one-shot, no config:  /collab ${relay.url}`);
-	}
+	console.log(`omp-ngrok-relay ${VERSION} listening on ${relay.url}`);
+	console.log(`  hosting bind:  ${relay.url}`);
+	console.log(`     omp config set collab.relayUrl ${relay.url}`);
+	console.log(`     or one-shot, no config:  /collab ${relay.url}`);
 	console.log(`  tunnel origin (guests only):  ${relay.edgeUrl}`);
 
 	try {
